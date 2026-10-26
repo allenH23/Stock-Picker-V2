@@ -12,7 +12,7 @@ import time
 # 頁面基本設定與手機版 UI 樣式優化
 # ==========================================
 st.set_page_config(
-    page_title="智慧選股系統",
+    page_title="智慧選股系統V2.0",
     page_icon="📈",
     layout="wide"
 )
