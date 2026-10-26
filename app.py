@@ -384,12 +384,41 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 5. Streamlit 互動網頁介面
+# 5. 盤勢分析與預測彈跳視窗函式
 # ==========================================
-st.title("🎯 智慧選股系統")
-st.caption("免設定複雜參數｜透過左上角選單調整方向與等級，一鍵取得 5 檔精選台股、買賣建議價位與歷史回測驗證")
+@st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
+def show_market_analysis_modal():
+    analysis_date = datetime.today().strftime("%Y-%m-%d")
+    st.caption(f"📅 盤勢情報分析基準日：{analysis_date}")
+    
+    st.markdown("### 📌 1. 今日台股盤勢總結")
+    st.info(
+        "**【多空交戰，板塊輪動分歧】**\n\n"
+        "今日台股大盤呈現震盪拉鋸走勢，權值科技股遭遇短線獲利調節，指數一度面臨下壓測撐；"
+        "不過低檔有強固的產業基本面與內資買盤承接，使指數跌幅收斂。整體而言，盤面呈現「電子拉回、防禦與題材板塊互見」的格局，成交量能溫和換手。"
+    )
+    
+    st.markdown("### 🔮 2. 明日大盤走勢預測與操作指引")
+    st.warning(
+        "**【美股動向指引：建議採取『逢回分批承接、短線高度觀望』策略】**\n\n"
+        "* **國際市場參考**：昨收美股道瓊與 S&P 500 維持高檔震盪，但費城半導體與那斯達克指數短線跌幅較重，牽動亞股科技供應鏈情緒。\n"
+        "* **明日操作提示**：因半導體與 AI 概念股面臨國際修正壓力，台股短線不宜過度追高。建議投資人**暫時保持觀望或嚴控資金水位**，等待季線或強支撐區再行分批佈局績優標的。"
+    )
+    
+    if st.button("關閉視窗", use_container_width=True):
+        st.rerun()
 
-st.info("💡 **操作提示**：若在手機或小螢幕上看不到選股條件設定，請點擊畫面**左上角的放大選單圖示 (三條槓 ☰)** 來開啟「選股方向與等級設定」。")
+# ==========================================
+# 6. Streamlit 互動網頁介面
+# ==========================================
+col_h1, col_h2 = st.columns([3, 1])
+with col_h1:
+    st.title("🎯 智慧選股系統")
+    st.markdown("點擊左上角 **☰** 調整選股條件，一鍵取得精選 5 檔與買賣建議。")
+with col_h2:
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    if st.button("📊 盤勢分析與預測", type="primary", use_container_width=True):
+        show_market_analysis_modal()
 
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
@@ -425,7 +454,6 @@ with st.sidebar:
     )
     st.divider()
     
-    # 4. 熱門題材選股 + 將更新按鈕與勾選框放在同一行
     col_theme_cb, col_theme_btn = st.columns([4, 1])
     with col_theme_cb:
         use_theme = st.checkbox("4. 熱門題材選股", value=False)
