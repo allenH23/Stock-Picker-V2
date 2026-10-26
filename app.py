@@ -384,32 +384,91 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 5. 盤勢分析與預測彈跳視窗函式
+# 5. 動態市場數據抓取與智慧分析邏輯模組
+# ==========================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_live_market_data():
+    """透過 yfinance 即時抓取台股與美股關鍵指數漲跌幅"""
+    tickers = {
+        "TWII": "^TWII",   # 台股加權指數
+        "SOX": "^SOX",     # 費城半導體
+        "IXIC": "^IXIC",   # 那斯達克
+        "DJI": "^DJI"      # 道瓊工業
+    }
+    data = {}
+    for key, symbol in tickers.items():
+        try:
+            df = yf.download(symbol, period="5d", progress=False, auto_adjust=True)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                closes = df["Close"].dropna()
+                if len(closes) >= 2:
+                    curr = float(closes.iloc[-1])
+                    prev = float(closes.iloc[-2])
+                    pct = (curr / prev - 1) * 100
+                    data[key] = {"close": round(curr, 2), "pct": round(pct, 2)}
+        except Exception:
+            pass
+    return data
+
+def generate_dynamic_analysis_texts(market_data: dict):
+    """根據即時抓取的真實指數漲跌幅，動態運算並產生今日總結與明日預測文字"""
+    
+    # 預設基準
+    tw_pct = market_data.get("TWII", {}).get("pct", 0.0)
+    sox_pct = market_data.get("SOX", {}).get("pct", 0.0)
+    nasdaq_pct = market_data.get("IXIC", {}).get("pct", 0.0)
+    
+    # 1. 今日盤勢總結動態邏輯
+    if tw_pct > 0.8:
+        today_summary = f"**【多方強勢表態，主流買氣匯聚】**\n\n今日台股加權指數開高走高，終場大漲約 {tw_pct:+.2f}%。權值股與主流AI/半導體族群同步點火，市場成交量能擴增，多方氣勢凌厲，盤面結構呈現健康的多頭排列。"
+    elif tw_pct < -0.8:
+        today_summary = f"**【賣壓沉重，指數測撐調節】**\n\n今日台股受國際盤勢牽動或短線獲利回吐影響，指數開低走低，終場下挫約 {tw_pct:+.2f}%。權值科技股賣壓較重，資金轉入防禦型板塊，短線進入震盪測撐階段。"
+    else:
+        today_summary = f"**【多空拉鋸膠着，量縮狹幅盤整】**\n\n今日台股呈現狹幅震盪格局（漲跌幅 {tw_pct:+.2f}%），市場觀望氣氛濃厚，權值熄火而中小型題材股各自表現，成交量能溫和，盤面多空交戰無明顯單邊方向。"
+
+    # 2. 明日盤勢預測與操作指引動態邏輯 (強力對應美股費半與那斯達克)
+    if sox_pct < -1.2 or nasdaq_pct < -1.0:
+        tomorrow_pred = f"**【美股科技重挫：建議『高度觀望』，嚴控部位】**\n\n* **國際數據參考**：隔夜美股費半指數下跌 {sox_pct:+.2f}%、那斯達克下跌 {nasdaq_pct:+.2f}%，科技與半導體供應鏈面臨沉重修正壓力。\n* **明日操作建議**：受美股科技股走弱拖累，台股明日早盤恐面臨壓力。建議投資人**暫時採取觀望或降低持股水位**，切勿躁進接刀，等待支撐止穩訊號出現。"
+    elif sox_pct > 1.2 or nasdaq_pct > 1.0:
+        tomorrow_pred = f"**【美股強勢彈升：建議『逢回分批承接』】**\n\n* **國際數據參考**：隔夜美股費半大漲 {sox_pct:+.2f}%、科技股表現強勁，市場風險偏好回溫。\n* **明日操作建議**：國際半導體情緒轉佳，台股明日有望受到激勵開高。建議鎖定具備基本面優勢的強勢主流標的，採**逢回分批承接**策略積極佈局。"
+    else:
+        tomorrow_pred = f"**【國際盤勢平穩：建議『區間操作、精選個股』】**\n\n* **國際數據參考**：美股主要指數維持高檔震盪（費半變動 {sox_pct:+.2f}%），國際無重大系統性風險。\n* **明日操作建議**：明日大盤預期延續類股輪動格局，指數空間有限。建議依循選股系統篩選基本面與籌碼優異個股，進行**短線區間操作**。"
+
+    return today_summary, tomorrow_pred
+
+# ==========================================
+# 6. 盤勢分析與預測彈跳視窗函式
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
 def show_market_analysis_modal():
     analysis_date = datetime.today().strftime("%Y-%m-%d")
-    st.caption(f"📅 盤勢情報分析基準日：{analysis_date}")
+    st.caption(f"📅 盤勢情報分析基準日：{analysis_date} (數據來源：即時連線 Yahoo Finance)")
     
+    # 即時抓取行情並透過動態邏輯函數生成文字
+    with st.spinner("正在連線抓取台美股市最新即時數據並運算分析中..."):
+        market_data = get_live_market_data()
+        today_txt, tomorrow_txt = generate_dynamic_analysis_texts(market_data)
+    
+    # 顯示抓取到的關鍵指標數據快照
+    if market_data:
+        cols = st.columns(len(market_data))
+        for i, (k, v) in enumerate(market_data.items()):
+            cols[i].metric(f"{k} 指數", f"{v['close']:,}", f"{v['pct']:+.2f}%")
+            
+    st.markdown("---")
     st.markdown("### 📌 1. 今日台股盤勢總結")
-    st.info(
-        "**【多空交戰，板塊輪動分歧】**\n\n"
-        "今日台股大盤呈現震盪拉鋸走勢，權值科技股遭遇短線獲利調節，指數一度面臨下壓測撐；"
-        "不過低檔有強固的產業基本面與內資買盤承接，使指數跌幅收斂。整體而言，盤面呈現「電子拉回、防禦與題材板塊互見」的格局，成交量能溫和換手。"
-    )
+    st.info(today_txt)
     
     st.markdown("### 🔮 2. 明日大盤走勢預測與操作指引")
-    st.warning(
-        "**【美股動向指引：建議採取『逢回分批承接、短線高度觀望』策略】**\n\n"
-        "* **國際市場參考**：昨收美股道瓊與 S&P 500 維持高檔震盪，但費城半導體與那斯達克指數短線跌幅較重，牽動亞股科技供應鏈情緒。\n"
-        "* **明日操作提示**：因半導體與 AI 概念股面臨國際修正壓力，台股短線不宜過度追高。建議投資人**暫時保持觀望或嚴控資金水位**，等待季線或強支撐區再行分批佈局績優標的。"
-    )
+    st.warning(tomorrow_txt)
     
     if st.button("關閉視窗", use_container_width=True):
         st.rerun()
 
 # ==========================================
-# 6. Streamlit 互動網頁介面
+# 7. Streamlit 互動網頁介面
 # ==========================================
 col_h1, col_h2 = st.columns([3, 1])
 with col_h1:
