@@ -4,10 +4,11 @@ import numpy as np
 import requests
 import yfinance as yf
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 import re
 import time
 import os
+import json
 
 # ==========================================
 # 頁面基本設定與手機版 UI 樣式優化
@@ -41,6 +42,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 CACHE_PARQUET_FILE = "market_cache.parquet"
+META_JSON_FILE = "market_cache_meta.json"
 
 # ==========================================
 # 0. App Store 合規免責聲明機制 (Dialog)
@@ -99,33 +101,68 @@ def refresh_market_themes():
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # ==========================================
-# 2. 第一階段：具備 Parquet 磁碟快取的全市場資料獲取模組
+# 2. 台股開盤日、連假休市與基準日標籤計算
 # ==========================================
-def is_parquet_cache_valid(file_path: str, max_age_hours: int = 12) -> bool:
-    """檢查 Parquet 快取是否存在且建立時間在指定小時內"""
+def is_tw_market_holiday(target_date: datetime.date) -> bool:
+    if target_date.weekday() >= 5:
+        return True
+    TW_HOLIDAYS_SET = {
+        "2026-01-01", "2026-02-13", "2026-02-16", "2026-02-17", "2026-02-18",
+        "2026-02-19", "2026-02-20", "2026-02-27", "2026-04-03", "2026-04-06",
+        "2026-05-01", "2026-06-19", "2026-09-25", "2026-10-09"
+    }
+    return target_date.strftime("%Y-%m-%d") in TW_HOLIDAYS_SET
+
+def get_latest_trading_cutoff(now: datetime = None) -> datetime:
+    if now is None:
+        now = datetime.now()
+    today_date = now.date()
+    today_cutoff = datetime.combine(today_date, dtime(16, 30, 0))
+
+    if not is_tw_market_holiday(today_date) and now >= today_cutoff:
+        return today_cutoff
+
+    check_date = today_date - timedelta(days=1)
+    while is_tw_market_holiday(check_date):
+        check_date -= timedelta(days=1)
+    return datetime.combine(check_date, dtime(16, 30, 0))
+
+def format_trading_date_label(dt: datetime) -> str:
+    weekday_map = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
+    return f"{dt.strftime('%Y-%m-%d')} {weekday_map.get(dt.weekday(), '')} 盤後"
+
+def is_parquet_cache_valid_with_holidays(file_path: str) -> bool:
     if not os.path.exists(file_path):
         return False
-    mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
-    age = datetime.now() - mtime
-    return age.total_seconds() < (max_age_hours * 3600)
+    cache_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+    latest_required_cutoff = get_latest_trading_cutoff()
+    return cache_mtime >= latest_required_cutoff
 
+# ==========================================
+# 3. 第一階段：具備 Parquet 磁碟快取的全市場資料獲取模組
+# ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_full_market_universe(force_refresh: bool = False):
-    """
-    優先從本地 market_cache.parquet 讀取；
-    若不存在、已過期或強制重整，則連線 TWSE/TPEx OpenAPI 抓取並自動存入 Parquet。
-    """
-    # 1. 優先檢查本地 Parquet 快取
-    if not force_refresh and is_parquet_cache_valid(CACHE_PARQUET_FILE, max_age_hours=12):
+    actual_trading_dt = get_latest_trading_cutoff()
+    computed_date_label = format_trading_date_label(actual_trading_dt)
+
+    # 1. 優先從本地 Parquet 磁碟載入
+    if not force_refresh and is_parquet_cache_valid_with_holidays(CACHE_PARQUET_FILE):
         try:
             df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
+            trading_date_str = computed_date_label
+            if os.path.exists(META_JSON_FILE):
+                with open(META_JSON_FILE, "r", encoding="utf-8") as f:
+                    meta_info = json.load(f)
+                    trading_date_str = meta_info.get("trading_date_label", computed_date_label)
+
             if not df_cached.empty and len(df_cached) >= 50:
                 df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
-                return df_cached, False, "parquet_disk"
+                return df_cached, False, "parquet_disk", trading_date_str
         except Exception:
             pass
 
-    # 2. 本地快取無效，連線官方 OpenAPI 抓取
+    # 2. 連線官方 OpenAPI 抓取最新盤後資料
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
     is_fallback = False
@@ -210,8 +247,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
         pass
 
     full_df = pd.DataFrame(market_rows)
+    trading_date_label = computed_date_label
     
-    # 3. 官方連線成功 -> 原子寫入 Parquet 快取
     if not full_df.empty and len(full_df) >= 50:
         try:
             save_cols = [
@@ -223,6 +260,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
             if os.path.exists(CACHE_PARQUET_FILE):
                 os.remove(CACHE_PARQUET_FILE)
             os.rename(temp_file, CACHE_PARQUET_FILE)
+            with open(META_JSON_FILE, "w", encoding="utf-8") as f:
+                json.dump({"trading_date_label": trading_date_label}, f)
             source_type = "official_api_saved_to_parquet"
         except Exception:
             source_type = "official_api"
@@ -264,10 +303,10 @@ def fetch_full_market_universe(force_refresh: bool = False):
         full_df = pd.DataFrame(fallback_data, columns=["stock_id", "stock_name", "market", "close", "volume_sheets", "pe_ratio", "dividend_yield", "pb_ratio"])
         
     full_df["themes"] = full_df["stock_id"].apply(get_stock_themes)
-    return full_df, is_fallback, source_type
+    return full_df, is_fallback, source_type, trading_date_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩 (Top 25)
+# 4. 第一階段漏斗初篩 (Top 25)
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
     df = full_df.copy()
@@ -300,7 +339,7 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25)
     return ranked_pool
 
 # ==========================================
-# 4. 第二階段：精準技術指標與價位運算
+# 5. 第二階段：精準技術指標與價位運算
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
@@ -408,7 +447,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
     return final_df, history_dict
 
 # ==========================================
-# 5. 回測引擎
+# 6. 回測引擎
 # ==========================================
 def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookback_days: int = 120):
     close_matrix = pd.DataFrame()
@@ -460,7 +499,7 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 6. 動態市場數據抓取與智慧分析模組
+# 7. 動態市場數據抓取與智慧分析模組
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_live_market_data():
@@ -509,12 +548,12 @@ def generate_dynamic_analysis_texts(market_data: dict):
     return today_summary, tomorrow_pred
 
 # ==========================================
-# 7. 盤勢分析與預測彈跳視窗
+# 8. 盤勢分析與預測彈跳視窗 (同步顯示資料基準日)
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
-def show_market_analysis_modal():
-    analysis_date = datetime.today().strftime("%Y-%m-%d")
-    st.caption(f"📅 盤勢情報分析基準日：{analysis_date}")
+def show_market_analysis_modal(trading_date_str: str):
+    # 同步顯示資料基準日標籤 (含中文星期與盤後)
+    st.caption(f"📅 盤勢情報分析基準日：**`{trading_date_str}`** (數據來源：即時連線 Yahoo Finance)")
     
     with st.spinner("正在連線抓取全球最新盤後市場數據並運算分析中..."):
         market_data = get_live_market_data()
@@ -538,21 +577,8 @@ def show_market_analysis_modal():
         st.rerun()
 
 # ==========================================
-# 8. Streamlit 互動網頁主介面
+# 9. Streamlit 互動網頁主介面
 # ==========================================
-col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
-with col_h1:
-    st.title("🎯 智慧選股系統")
-    st.markdown("點擊左上角 **☰** 調整選股條件，一鍵取得精選 5 檔與買賣建議。")
-with col_h2:
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("📊 盤勢分析與預測", type="primary", use_container_width=True):
-        show_market_analysis_modal()
-with col_h3:
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("⚠️ 免責聲明", use_container_width=True):
-        show_legal_disclaimer_modal(forced_consent=False)
-
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
 if "force_refresh_cache" not in st.session_state:
@@ -612,15 +638,21 @@ with st.sidebar:
     lookback = st.select_slider("回測歷史天數 (交易日)", options=[60, 120, 240], value=120)
     
     st.divider()
-    st.subheader("💾 本地 Parquet 快取狀態")
+    st.subheader("💾 盤後資料狀態")
     if os.path.exists(CACHE_PARQUET_FILE):
-        cache_mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE)).strftime("%Y-%m-%d %H:%M")
+        mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
+        mtime_str = mtime.strftime("%Y-%m-%d %H:%M")
+        is_latest = is_parquet_cache_valid_with_holidays(CACHE_PARQUET_FILE)
         cache_size = os.path.getsize(CACHE_PARQUET_FILE) / 1024.0
-        st.caption(f"• 快取檔案：`{CACHE_PARQUET_FILE}`\n• 更新時間：`{cache_mtime}`\n• 檔案大小：`{cache_size:.1f} KB`")
+
+        if is_latest:
+            st.caption(f"🟢 **狀態：已是最新盤後資料**\n• 快取更新時間：`{mtime_str}`\n• 檔案大小：`{cache_size:.1f} KB`")
+        else:
+            st.caption(f"🟡 **狀態：待更新盤後資料**\n• 目前快取：`{mtime_str}`\n• 系統將於下次查詢時自動同步")
     else:
-        st.caption("• 快取檔案：尚未建立 (將於首次載入自動建立)")
+        st.caption("⚪ 快取尚未建立")
         
-    if st.button("🗑️ 強制重新抓取並更新快取", use_container_width=True):
+    if st.button("🔄 強制重新抓取並更新快取", use_container_width=True):
         st.session_state.force_refresh_cache = True
         st.cache_data.clear()
         st.rerun()
@@ -630,10 +662,10 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 執行兩階段篩選引擎 (優先讀取 Parquet)
+# 執行兩階段篩選引擎 (取得資料基準日標籤)
 with st.spinner("🚀 正在載入全市場大數據（優先讀取 Parquet 磁碟快取）並計算 K 線指標..."):
     force_run = st.session_state.force_refresh_cache
-    full_universe_df, is_fallback_mode, data_src = fetch_full_market_universe(force_refresh=force_run)
+    full_universe_df, is_fallback_mode, data_src, data_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
         st.toast("✅ 已強制向官方更新最新盤後資料並寫入 Parquet 快取！")
@@ -647,7 +679,20 @@ with st.spinner("🚀 正在載入全市場大數據（優先讀取 Parquet 磁�
     stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
 
-# 狀態提示
+# 頂部標題與按鈕區塊 (主頁頂端同步標註資料基準日)
+col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
+with col_h1:
+    st.title("🎯 智慧選股系統")
+    st.markdown(f"📅 **資料基準日：`{data_trading_date}`** ｜ 點擊左上角 **☰** 調整選股條件。")
+with col_h2:
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    if st.button("📊 盤勢分析與預測", type="primary", use_container_width=True):
+        show_market_analysis_modal(data_trading_date)
+with col_h3:
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    if st.button("⚠️ 免責聲明", use_container_width=True):
+        show_legal_disclaimer_modal(forced_consent=False)
+
 if is_fallback_mode:
     st.warning("⚠️ **目前為離線備援資料模式**：官方 OpenAPI 連線異常或處於伺服器維護時段，系統已自動啟用內建基準資料供操作示範，待連線恢復後將自動同步全市場即時數據。")
 elif data_src == "parquet_disk":
@@ -756,9 +801,9 @@ with tab_verify:
     if st.button("🚀 執行 TWSE / TPEx 官方 OpenAPI 連線驗證"):
         with st.spinner("連線至 TWSE 與 TPEx OpenAPI 中..."):
             try:
-                live_snap, fb, src = fetch_full_market_universe(force_refresh=True)
+                live_snap, fb, src, snap_date = fetch_full_market_universe(force_refresh=True)
                 mode_desc = "（離線備援資料）" if fb else "（即時官方 OpenAPI）"
-                st.success(f"驗證成功！共取得 {len(live_snap)} 檔有效流動性普通股 {mode_desc}。")
+                st.success(f"驗證成功！資料基準日：{snap_date}，共取得 {len(live_snap)} 檔有效流動性普通股 {mode_desc}。")
                 st.dataframe(live_snap.head(15), use_container_width=True, hide_index=True)
             except Exception as e:
                 st.error(f"連線發生例外：{e}")
