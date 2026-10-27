@@ -26,8 +26,48 @@ st.markdown("""
         margin-top: 10px;
         color: #1a73e8;
     }
+    .disclaimer-banner {
+        padding: 12px 16px;
+        background-color: #f8f9fa;
+        border-left: 4px solid #f44336;
+        border-radius: 4px;
+        font-size: 0.85rem;
+        color: #555555;
+        margin-top: 25px;
+        margin-bottom: 25px;
+    }
     </style>
 """, unsafe_allow_html=True)
+
+# ==========================================
+# 0. App Store 合規免責聲明機制 (Dialog)
+# ==========================================
+if "disclaimer_accepted" not in st.session_state:
+    st.session_state.disclaimer_accepted = False
+
+@st.dialog("⚖️ 投資風險與法律免責聲明", width="large")
+def show_legal_disclaimer_modal(forced_consent: bool = False):
+    st.markdown("### ⚠️ 使用者須知與風險宣告")
+    st.markdown("""
+    感謝您使用**「智慧選股系統」**（以下簡稱「本系統」）。在使用本系統提供的任何資訊、數據、指標及分析工具前，請仔細閱讀以下法律聲明：
+    
+    1. **非證券投資顧問業務**：本系統所載之所有選股結果、策略回測、買賣建議區間及盤勢分析，均基於歷史盤後公開數據及量化演算法運算呈現，**僅供學術研究、量化模型驗證與教育模擬用途**，不構成任何形式的投資招攬、買賣建議或金融顧問服務。
+    2. **歷史績效不保證未來獲利**：過往之技術指標表現、勝率統計或歷史回測曲線，均不代表亦不保證未來之實際投資報酬。金融市場受國內外政經情勢、總體經濟及突發事件等多重不可抗力因素影響，風險難以完全預估。
+    3. **獨立審慎評估與風險自負**：本系統所引用之即時或盤後數據源自台灣證券交易所、證券櫃檯買賣中心及第三方資訊服務商，本系統力求數據之客觀與正確，但對數據延遲、遺漏或計算偏差不負法律保證責任。**使用者應依個人財務狀況、風險承受能力獨立判斷並自負投資盈虧責任**。
+    """)
+    st.markdown("---")
+    
+    if forced_consent:
+        agree = st.checkbox("我已詳細閱讀、理解並完全同意上述投資風險與法律免責聲明。")
+        if st.button("確認並進入系統", type="primary", disabled=not agree, use_container_width=True):
+            st.session_state.disclaimer_accepted = True
+            st.rerun()
+    else:
+        if st.button("關閉聲明", use_container_width=True):
+            st.rerun()
+
+if not st.session_state.disclaimer_accepted:
+    show_legal_disclaimer_modal(forced_consent=True)
 
 # ==========================================
 # 1. 熱門題材概念股字典與動態更新機制
@@ -56,18 +96,14 @@ def refresh_market_themes():
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # ==========================================
-# 2. 第一階段：全台股 1,800 檔官方 OpenAPI 盤後資料擷取與清洗
+# 2. 第一階段：全台股 1,800 檔官方 OpenAPI 盤後資料擷取與清洗 (含備援標記)
 # ==========================================
 @st.cache_data(ttl=3600*2, show_spinner=False)
 def fetch_full_market_universe():
-    """
-    從 TWSE 與 TPEx 官方 OpenAPI 抓取近 1,800 檔上市櫃普通股快照。
-    嚴格過濾：4碼純數字普通股 (^[1-9]\\d{3}$)，並取得收盤價、成交量、PE、PB、殖利率。
-    """
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
+    is_fallback = False
 
-    # 1. 抓取上市 (TWSE) 本益比與殖利率快照
     pe_twse = {}
     try:
         r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=8)
@@ -84,7 +120,6 @@ def fetch_full_market_universe():
     except Exception:
         pass
 
-    # 2. 抓取上市 (TWSE) 當日收盤行情與成交量
     try:
         r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=8)
         if r_p.status_code == 200:
@@ -95,7 +130,7 @@ def fetch_full_market_universe():
                     close_p = pd.to_numeric(str(row.get("ClosingPrice", "")).replace(",", ""), errors="coerce")
                     vol_sheets = vol_shares / 1000.0 if pd.notnull(vol_shares) else 0.0
                     
-                    if pd.notnull(close_p) and close_p > 0 and vol_sheets >= 300: # 剔除低流動性殭屍股
+                    if pd.notnull(close_p) and close_p > 0 and vol_sheets >= 300:
                         item = pe_twse[code]
                         market_rows.append({
                             "stock_id": code,
@@ -110,10 +145,9 @@ def fetch_full_market_universe():
     except Exception:
         pass
 
-    # 3. 抓取上櫃 (TPEx) 本益比與當日收盤行情
     try:
-        r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=8)
         r_otc_pe = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=headers, timeout=8)
+        r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=8)
         
         pe_otc = {}
         if r_otc_pe.status_code == 200:
@@ -151,8 +185,9 @@ def fetch_full_market_universe():
 
     full_df = pd.DataFrame(market_rows)
     
-    # 安全備援降級方案 (若遇官方維護或離線)
+    # 觸發容錯降級機制
     if full_df.empty or len(full_df) < 50:
+        is_fallback = True
         fallback_data = [
             ("2330", "台積電", "上市", 1050.0, 38500, 21.5, 1.8, 6.2),
             ("2317", "鴻海", "上市", 205.0, 42100, 14.2, 3.2, 1.8),
@@ -188,16 +223,15 @@ def fetch_full_market_universe():
         full_df = pd.DataFrame(fallback_data, columns=["stock_id", "stock_name", "market", "close", "volume_sheets", "pe_ratio", "dividend_yield", "pb_ratio"])
         
     full_df["themes"] = full_df["stock_id"].apply(get_stock_themes)
-    return full_df
+    return full_df, is_fallback
 
 # ==========================================
-# 3. 第一階段漏斗快速初篩與評分（從 1,800 檔篩出 Top 25）
+# 3. 第一階段漏斗初篩
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
     df = full_df.copy()
     df["stage1_score"] = 0.0
 
-    # 1. 基本面初篩加權
     if selections["fundamental"]["enabled"]:
         lvl = selections["fundamental"]["level"]
         if lvl == "嚴格績優":
@@ -208,34 +242,27 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25)
             cond = (df["pe_ratio"] <= 38) & (df["pb_ratio"] <= 6.0)
         df["stage1_score"] += cond.astype(int) * 35.0 + (df["dividend_yield"] * 2.5) - (df["pe_ratio"] * 0.2)
 
-    # 2. 籌碼與流動性加權
     if selections["market"]["enabled"]:
         lvl = selections["market"]["level"]
         vol_req = 3000 if lvl == "法人重倉連買" else (1500 if lvl == "法人溫和布局" else 600)
         cond = df["volume_sheets"] >= vol_req
         df["stage1_score"] += cond.astype(int) * 30.0 + np.log1p(df["volume_sheets"]) * 3.0
 
-    # 3. 熱門題材加權
     if selections["theme"]["enabled"]:
         lvl = selections["theme"]["level"]
         target = lvl
         cond = df["themes"].apply(lambda t_list: any(target in t for t in t_list))
         df["stage1_score"] += cond.astype(int) * 50.0
 
-    # 流動性安全閥
     df["stage1_score"] += np.log1p(df["volume_sheets"]) * 1.5
     ranked_pool = df.sort_values(by="stage1_score", ascending=False).head(top_n).reset_index(drop=True)
     return ranked_pool
 
 # ==========================================
-# 4. 第二階段：針對 Top 25 精準抓取 K 線、計算技術指標與買賣價
+# 4. 第二階段：精準技術指標與價位運算
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
-    """
-    僅針對初篩出的 25 檔候選股向 yfinance 抓取歷史日 K 線，
-    計算 MA5, MA20, MA60, RSI14, ATR14、短期與中長買賣建議價，並建立回測歷史字典。
-    """
     history_dict = {}
     enriched_rows = []
     
@@ -256,7 +283,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
         except Exception:
             hist_df = pd.DataFrame()
             
-        # 若遇離線或連線異常，自動產生貼合該股最新收盤價的擬真序列
         if hist_df.empty:
             drift = 0.0006
             rets = np.random.normal(drift, 0.02, len(dates))
@@ -314,7 +340,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
-        # 綜合推薦一句話理由
         trend_desc = "呈多頭排列" if last_close >= last_ma20 else "回測均線支撐"
         reason = f"本益比 {row['pe_ratio']:.1f} 倍、殖利率 {row['dividend_yield']:.1f}%，股價站穩關鍵均線{trend_desc}（RSI {last_rsi:.1f}，成交量 {int(row['volume_sheets']):,} 張）。"
         
@@ -394,7 +419,7 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 6. 動態市場數據抓取與智慧分析邏輯模組
+# 6. 動態市場數據抓取與智慧分析模組
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_live_market_data():
@@ -474,7 +499,7 @@ def show_market_analysis_modal():
 # ==========================================
 # 8. Streamlit 互動網頁主介面
 # ==========================================
-col_h1, col_h2 = st.columns([3, 1])
+col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
 with col_h1:
     st.title("🎯 智慧選股系統")
     st.markdown("點擊左上角 **☰** 調整選股條件，一鍵取得精選 5 檔與買賣建議。")
@@ -482,6 +507,10 @@ with col_h2:
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("📊 盤勢分析與預測", type="primary", use_container_width=True):
         show_market_analysis_modal()
+with col_h3:
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    if st.button("⚠️ 免責聲明", use_container_width=True):
+        show_legal_disclaimer_modal(forced_consent=False)
 
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
@@ -546,8 +575,7 @@ if st.session_state.get("last_config_key") != current_config_key:
 
 # 執行兩階段篩選引擎
 with st.spinner("🚀 正在執行兩階段全市場 1,800 檔盤後大數據篩選與 K 線計算中..."):
-    # 階段一：全市場 1,800 檔 OpenAPI 漏斗快篩
-    full_universe_df = fetch_full_market_universe()
+    full_universe_df, is_fallback_mode = fetch_full_market_universe()
     selections = {
         "fundamental": {"enabled": use_fund, "level": lvl_fund},
         "technical": {"enabled": use_tech, "level": lvl_tech},
@@ -555,9 +583,11 @@ with st.spinner("🚀 正在執行兩階段全市場 1,800 檔盤後大數據篩
         "theme": {"enabled": use_theme, "level": lvl_theme},
     }
     stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
-    
-    # 階段二：Top 25 檔精準計算日 K 線指標與買賣價
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
+
+# 若觸發備援資料，於頁面頂部顯示醒目警告橫幅
+if is_fallback_mode:
+    st.warning("⚠️ **目前為離線備援資料模式**：官方 OpenAPI 連線異常或處於伺服器維護時段，系統已自動啟用內建基準資料供操作示範，待連線恢復後將自動同步全市場即時數據。")
 
 batch_size = 5
 total_batches = max(1, int(np.ceil(len(ranked_df) / batch_size)))
@@ -566,7 +596,6 @@ start_idx = current_page * batch_size
 end_idx = start_idx + batch_size
 current_5_df = ranked_df.iloc[start_idx:end_idx].copy()
 
-# 組合回測
 port_nav, bm_nav, stock_bt_df, bt_metrics = run_portfolio_backtest(current_5_df, history_dict, lookback_days=lookback)
 
 col_title, col_btn1, col_btn2 = st.columns([3, 1, 1])
@@ -581,7 +610,6 @@ with col_btn2:
         st.session_state.batch_page = 0
         st.rerun()
 
-# 置頂總覽表格 (免下滑立即看)
 overview_merge = pd.merge(
     current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
     stock_bt_df[["代號", f"近{lookback}日報酬(%)", "月線順勢勝率(%)"]],
@@ -606,7 +634,6 @@ overview_table = overview_merge[[
 st.markdown(f"##### 📋 精選 5 檔數據總覽（含近 {lookback} 日區間報酬、勝率與買賣建議價格）")
 st.dataframe(overview_table, use_container_width=True, hide_index=True)
 
-# 逐檔詳細卡片
 for rank_num, (_, row) in enumerate(current_5_df.iterrows(), start=start_idx + 1):
     with st.container(border=True):
         c1, c2, c3 = st.columns([2.2, 2.5, 2.5])
@@ -625,7 +652,13 @@ for rank_num, (_, row) in enumerate(current_5_df.iterrows(), start=start_idx + 1
             st.markdown(f"- 🎯 **目標停利賣出**：`{row['mid_target']}` 元")
             st.markdown(f"- 🛡️ **防守停損價位**：`{row['mid_stop']}` 元")
 
-# 底部功能分頁
+st.markdown("""
+<div class="disclaimer-banner">
+    <strong>⚖️ 投資風險與合規警語：</strong><br>
+    本系統所有選股結果、策略回測數值與價格區間僅供量化研究與演算法教學展示，不構成任何證券之要約或投資買賣建議。過往績效不保證未來獲利，投資人應獨立判斷並自負交易盈虧責任。
+</div>
+""", unsafe_allow_html=True)
+
 st.divider()
 tab_bt, tab_detail, tab_verify = st.tabs([
     "📊 推薦組合淨值曲線與風險指標", 
@@ -659,8 +692,9 @@ with tab_verify:
     if st.button("🚀 執行 TWSE / TPEx 官方 OpenAPI 連線驗證"):
         with st.spinner("連線至 TWSE 與 TPEx OpenAPI 中..."):
             try:
-                live_snap = fetch_full_market_universe()
-                st.success(f"驗證成功！共抓回 {len(live_snap)} 檔上市櫃有效流動性普通股（已自動排除 ETF、權證與特別股）。")
+                live_snap, fb = fetch_full_market_universe()
+                mode_desc = "（離線備援資料）" if fb else "（即時官方 OpenAPI）"
+                st.success(f"驗證成功！共取得 {len(live_snap)} 檔有效流動性普通股 {mode_desc}。")
                 st.dataframe(live_snap.head(15), use_container_width=True, hide_index=True)
             except Exception as e:
                 st.error(f"連線發生例外：{e}")
