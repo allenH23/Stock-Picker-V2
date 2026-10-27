@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import re
 import time
+import os
 
 # ==========================================
 # 頁面基本設定與手機版 UI 樣式優化
@@ -38,6 +39,8 @@ st.markdown("""
     }
     </style>
 """, unsafe_allow_html=True)
+
+CACHE_PARQUET_FILE = "market_cache.parquet"
 
 # ==========================================
 # 0. App Store 合規免責聲明機制 (Dialog)
@@ -96,10 +99,33 @@ def refresh_market_themes():
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # ==========================================
-# 2. 第一階段：全台股 1,800 檔官方 OpenAPI 盤後資料擷取與清洗 (含備援標記)
+# 2. 第一階段：具備 Parquet 磁碟快取的全市場資料獲取模組
 # ==========================================
-@st.cache_data(ttl=3600*2, show_spinner=False)
-def fetch_full_market_universe():
+def is_parquet_cache_valid(file_path: str, max_age_hours: int = 12) -> bool:
+    """檢查 Parquet 快取是否存在且建立時間在指定小時內"""
+    if not os.path.exists(file_path):
+        return False
+    mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
+    age = datetime.now() - mtime
+    return age.total_seconds() < (max_age_hours * 3600)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_full_market_universe(force_refresh: bool = False):
+    """
+    優先從本地 market_cache.parquet 讀取；
+    若不存在、已過期或強制重整，則連線 TWSE/TPEx OpenAPI 抓取並自動存入 Parquet。
+    """
+    # 1. 優先檢查本地 Parquet 快取
+    if not force_refresh and is_parquet_cache_valid(CACHE_PARQUET_FILE, max_age_hours=12):
+        try:
+            df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
+            if not df_cached.empty and len(df_cached) >= 50:
+                df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
+                return df_cached, False, "parquet_disk"
+        except Exception:
+            pass
+
+    # 2. 本地快取無效，連線官方 OpenAPI 抓取
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
     is_fallback = False
@@ -185,9 +211,24 @@ def fetch_full_market_universe():
 
     full_df = pd.DataFrame(market_rows)
     
-    # 觸發容錯降級機制
-    if full_df.empty or len(full_df) < 50:
+    # 3. 官方連線成功 -> 原子寫入 Parquet 快取
+    if not full_df.empty and len(full_df) >= 50:
+        try:
+            save_cols = [
+                "stock_id", "stock_name", "market", "close", 
+                "volume_sheets", "pe_ratio", "dividend_yield", "pb_ratio"
+            ]
+            temp_file = CACHE_PARQUET_FILE + ".tmp"
+            full_df[save_cols].to_parquet(temp_file, compression="snappy", index=False)
+            if os.path.exists(CACHE_PARQUET_FILE):
+                os.remove(CACHE_PARQUET_FILE)
+            os.rename(temp_file, CACHE_PARQUET_FILE)
+            source_type = "official_api_saved_to_parquet"
+        except Exception:
+            source_type = "official_api"
+    else:
         is_fallback = True
+        source_type = "fallback_mock"
         fallback_data = [
             ("2330", "台積電", "上市", 1050.0, 38500, 21.5, 1.8, 6.2),
             ("2317", "鴻海", "上市", 205.0, 42100, 14.2, 3.2, 1.8),
@@ -223,10 +264,10 @@ def fetch_full_market_universe():
         full_df = pd.DataFrame(fallback_data, columns=["stock_id", "stock_name", "market", "close", "volume_sheets", "pe_ratio", "dividend_yield", "pb_ratio"])
         
     full_df["themes"] = full_df["stock_id"].apply(get_stock_themes)
-    return full_df, is_fallback
+    return full_df, is_fallback, source_type
 
 # ==========================================
-# 3. 第一階段漏斗初篩
+# 3. 第一階段漏斗初篩 (Top 25)
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
     df = full_df.copy()
@@ -514,6 +555,8 @@ with col_h3:
 
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
+if "force_refresh_cache" not in st.session_state:
+    st.session_state.force_refresh_cache = False
 
 with st.sidebar:
     st.header("⚙️ 選股方向與等級設定")
@@ -567,15 +610,34 @@ with st.sidebar:
     st.divider()
     
     lookback = st.select_slider("回測歷史天數 (交易日)", options=[60, 120, 240], value=120)
+    
+    st.divider()
+    st.subheader("💾 本地 Parquet 快取狀態")
+    if os.path.exists(CACHE_PARQUET_FILE):
+        cache_mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE)).strftime("%Y-%m-%d %H:%M")
+        cache_size = os.path.getsize(CACHE_PARQUET_FILE) / 1024.0
+        st.caption(f"• 快取檔案：`{CACHE_PARQUET_FILE}`\n• 更新時間：`{cache_mtime}`\n• 檔案大小：`{cache_size:.1f} KB`")
+    else:
+        st.caption("• 快取檔案：尚未建立 (將於首次載入自動建立)")
+        
+    if st.button("🗑️ 強制重新抓取並更新快取", use_container_width=True):
+        st.session_state.force_refresh_cache = True
+        st.cache_data.clear()
+        st.rerun()
 
 current_config_key = f"{use_fund}_{lvl_fund}_{use_tech}_{lvl_tech}_{use_mkt}_{lvl_mkt}_{use_theme}_{lvl_theme}_{st.session_state.theme_last_update}"
 if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 執行兩階段篩選引擎
-with st.spinner("🚀 正在執行兩階段全市場 1,800 檔盤後大數據篩選與 K 線計算中..."):
-    full_universe_df, is_fallback_mode = fetch_full_market_universe()
+# 執行兩階段篩選引擎 (優先讀取 Parquet)
+with st.spinner("🚀 正在載入全市場大數據（優先讀取 Parquet 磁碟快取）並計算 K 線指標..."):
+    force_run = st.session_state.force_refresh_cache
+    full_universe_df, is_fallback_mode, data_src = fetch_full_market_universe(force_refresh=force_run)
+    if force_run:
+        st.session_state.force_refresh_cache = False
+        st.toast("✅ 已強制向官方更新最新盤後資料並寫入 Parquet 快取！")
+
     selections = {
         "fundamental": {"enabled": use_fund, "level": lvl_fund},
         "technical": {"enabled": use_tech, "level": lvl_tech},
@@ -585,9 +647,11 @@ with st.spinner("🚀 正在執行兩階段全市場 1,800 檔盤後大數據篩
     stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
 
-# 若觸發備援資料，於頁面頂部顯示醒目警告橫幅
+# 狀態提示
 if is_fallback_mode:
     st.warning("⚠️ **目前為離線備援資料模式**：官方 OpenAPI 連線異常或處於伺服器維護時段，系統已自動啟用內建基準資料供操作示範，待連線恢復後將自動同步全市場即時數據。")
+elif data_src == "parquet_disk":
+    st.caption("⚡ **資料狀態**：已成功自本地 `market_cache.parquet` 快速載入（0 延遲，不佔用 API 配額）。")
 
 batch_size = 5
 total_batches = max(1, int(np.ceil(len(ranked_df) / batch_size)))
@@ -692,7 +756,7 @@ with tab_verify:
     if st.button("🚀 執行 TWSE / TPEx 官方 OpenAPI 連線驗證"):
         with st.spinner("連線至 TWSE 與 TPEx OpenAPI 中..."):
             try:
-                live_snap, fb = fetch_full_market_universe()
+                live_snap, fb, src = fetch_full_market_universe(force_refresh=True)
                 mode_desc = "（離線備援資料）" if fb else "（即時官方 OpenAPI）"
                 st.success(f"驗證成功！共取得 {len(live_snap)} 檔有效流動性普通股 {mode_desc}。")
                 st.dataframe(live_snap.head(15), use_container_width=True, hide_index=True)
