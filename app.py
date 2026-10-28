@@ -6,7 +6,6 @@ import yfinance as yf
 import plotly.graph_objects as go
 from datetime import datetime, timedelta, time as dtime
 import re
-import time
 import os
 import json
 
@@ -19,7 +18,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# 注入自訂 CSS：確保按鈕底色一定能變藍色
 st.markdown("""
     <style>
     [data-testid="collapsedControl"] {
@@ -39,8 +37,8 @@ st.markdown("""
         margin-top: 25px;
         margin-bottom: 25px;
     }
-    /* 強制將個股分析按鈕區塊設為顯眼藍底白字 */
-    div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
+    /* 個股分析按鈕純原生藍底樣式 */
+    div.row-widget.stButton button[kind="secondary"] {
         background-color: #1a73e8 !important;
         color: #ffffff !important;
         border: 1px solid #1a73e8 !important;
@@ -49,7 +47,7 @@ st.markdown("""
         border-radius: 8px !important;
         box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35) !important;
     }
-    div[data-testid="stHorizontalBlock"] button[kind="secondary"]:hover {
+    div.row-widget.stButton button[kind="secondary"]:hover {
         background-color: #1557b0 !important;
         border-color: #1557b0 !important;
         color: #ffffff !important;
@@ -112,12 +110,11 @@ def get_stock_themes(stock_id: str) -> list:
     return themes if themes else ["一般產業"]
 
 def refresh_market_themes():
-    time.sleep(0.8)
     st.session_state.theme_dict = DEFAULT_THEME_DICT.copy()
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # ==========================================
-# 2. 台股開盤日、連假休市與動態基準日計算
+# 2. 精準台股開盤日、連假休市與動態基準日計算
 # ==========================================
 def is_tw_market_holiday(target_date: datetime.date) -> bool:
     if target_date.weekday() >= 5:
@@ -135,11 +132,9 @@ def get_latest_trading_cutoff(now: datetime = None) -> datetime:
     today_date = now.date()
     today_cutoff = datetime.combine(today_date, dtime(16, 30, 0))
 
-    # 若今天不是假日且已經過 16:30，基準日就是今天
     if not is_tw_market_holiday(today_date) and now >= today_cutoff:
         return today_cutoff
 
-    # 否則往前回推最後一個有效交易日
     check_date = today_date - timedelta(days=1)
     while is_tw_market_holiday(check_date):
         check_date -= timedelta(days=1)
@@ -149,38 +144,36 @@ def format_trading_date_label(dt: datetime) -> str:
     weekday_map = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
     return f"{dt.strftime('%Y-%m-%d')} {weekday_map.get(dt.weekday(), '')} 盤後"
 
-def is_parquet_cache_valid_with_holidays(file_path: str) -> bool:
-    if not os.path.exists(file_path):
-        return False
-    cache_mtime = datetime.fromtimestamp(os.path.getmtime(file_path))
-    latest_required_cutoff = get_latest_trading_cutoff()
-    return cache_mtime >= latest_required_cutoff
-
 # ==========================================
-# 3. 第一階段：具備 Parquet 磁碟快取的全市場資料獲取模組
+# 3. 第一階段：全市場真實數據擷取與 Parquet 快取 (取消30檔備援資料)
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
     actual_trading_dt = get_latest_trading_cutoff()
-    computed_date_label = format_trading_date_label(actual_trading_dt)
+    required_date_label = format_trading_date_label(actual_trading_dt)
 
-    # 1. 檢查本地快取是否真的滿足當前最新交易日
-    if not force_refresh and is_parquet_cache_valid_with_holidays(CACHE_PARQUET_FILE):
+    # 1. 比對 Meta JSON 與 Parquet 快取是否存在且屬於「目標交易日」
+    if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
-            df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
-            if not df_cached.empty and len(df_cached) >= 50:
-                df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
-                return df_cached, False, "parquet_disk", computed_date_label
+            with open(META_JSON_FILE, "r", encoding="utf-8") as f:
+                meta_info = json.load(f)
+            cached_label = meta_info.get("trading_date_label", "")
+            
+            # 若快取內的日期標籤正好等於今日應有的最新交易日，直接秒讀
+            if cached_label == required_date_label:
+                df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
+                if not df_cached.empty and len(df_cached) >= 50:
+                    df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
+                    return df_cached, required_date_label
         except Exception:
             pass
 
-    # 2. 連線官方 OpenAPI 抓取最新盤後資料
+    # 2. 快取過期或不存在：向 TWSE / TPEx OpenAPI 抓取最新真實資料
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
-    is_fallback = False
 
     pe_twse = {}
     try:
-        r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=8)
+        r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=10)
         if r_pe.status_code == 200:
             for row in r_pe.json():
                 code = str(row.get("Code", "")).strip()
@@ -195,7 +188,7 @@ def fetch_full_market_universe(force_refresh: bool = False):
         pass
 
     try:
-        r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=8)
+        r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=10)
         if r_p.status_code == 200:
             for row in r_p.json():
                 code = str(row.get("Code", "")).strip()
@@ -220,8 +213,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
         pass
 
     try:
-        r_otc_pe = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=headers, timeout=8)
-        r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=8)
+        r_otc_pe = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=headers, timeout=10)
+        r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=10)
         
         pe_otc = {}
         if r_otc_pe.status_code == 200:
@@ -258,63 +251,30 @@ def fetch_full_market_universe(force_refresh: bool = False):
         pass
 
     full_df = pd.DataFrame(market_rows)
-    trading_date_label = computed_date_label
-    
-    if not full_df.empty and len(full_df) >= 50:
-        try:
-            save_cols = [
-                "stock_id", "stock_name", "market", "close", 
-                "volume_sheets", "pe_ratio", "dividend_yield", "pb_ratio"
-            ]
-            temp_file = CACHE_PARQUET_FILE + ".tmp"
-            full_df[save_cols].to_parquet(temp_file, compression="snappy", index=False)
-            if os.path.exists(CACHE_PARQUET_FILE):
-                os.remove(CACHE_PARQUET_FILE)
-            os.rename(temp_file, CACHE_PARQUET_FILE)
-            with open(META_JSON_FILE, "w", encoding="utf-8") as f:
-                json.dump({"trading_date_label": trading_date_label}, f)
-            source_type = "official_api_saved_to_parquet"
-        except Exception:
-            source_type = "official_api"
-    else:
-        is_fallback = True
-        source_type = "fallback_mock"
-        fallback_data = [
-            ("2330", "台積電", "上市", 1050.0, 38500, 21.5, 1.8, 6.2),
-            ("2317", "鴻海", "上市", 205.0, 42100, 14.2, 3.2, 1.8),
-            ("2454", "聯發科", "上市", 1280.0, 6400, 18.6, 4.5, 4.8),
-            ("2382", "廣達", "上市", 295.0, 15200, 17.8, 4.1, 5.1),
-            ("2308", "台達電", "上市", 390.0, 5300, 23.4, 2.5, 4.5),
-            ("3711", "日月光投控", "上市", 165.0, 11200, 14.8, 3.9, 2.1),
-            ("3231", "緯創", "上市", 115.0, 19500, 13.5, 4.2, 2.4),
-            ("2357", "華碩", "上市", 580.0, 4600, 12.9, 5.4, 1.7),
-            ("3017", "奇鋐", "上市", 640.0, 4200, 24.5, 1.9, 7.1),
-            ("3324", "雙鴻", "上櫃", 690.0, 2800, 22.1, 2.2, 6.0),
-            ("3131", "弘塑", "上櫃", 1550.0, 1500, 31.0, 1.5, 9.5),
-            ("3583", "辛耘", "上市", 430.0, 3100, 26.8, 1.8, 6.8),
-            ("6187", "萬潤", "上櫃", 450.0, 2400, 28.4, 1.6, 8.2),
-            ("3450", "聯鈞", "上市", 240.0, 9800, 29.5, 1.4, 5.6),
-            ("4979", "華星光", "上櫃", 168.0, 4100, 27.2, 1.7, 5.2),
-            ("3363", "上詮", "上櫃", 215.0, 3200, 35.0, 1.1, 6.4),
-            ("3163", "波若威", "上櫃", 145.0, 2600, 21.0, 2.8, 3.5),
-            ("6442", "光聖", "上市", 460.0, 3900, 25.6, 2.1, 7.0),
-            ("2345", "智邦", "上市", 560.0, 5100, 20.4, 2.9, 5.4),
-            ("6188", "廣明", "上櫃", 102.0, 2100, 19.2, 4.0, 2.9),
-            ("2049", "上銀", "上市", 245.0, 1800, 22.5, 2.4, 2.3),
-            ("2395", "研華", "上市", 340.0, 1200, 24.0, 3.1, 5.0),
-            ("1513", "中興電", "上市", 172.0, 6700, 14.5, 4.8, 3.8),
-            ("1519", "華城", "上市", 650.0, 3400, 23.8, 2.6, 9.1),
-            ("1504", "東元", "上市", 52.0, 8900, 11.8, 5.2, 1.3),
-            ("2891", "中信金", "上市", 37.5, 42000, 10.5, 5.6, 1.5),
-            ("2882", "國泰金", "上市", 66.0, 28000, 11.2, 4.9, 1.3),
-            ("2412", "中華電", "上市", 124.0, 4500, 25.1, 3.9, 2.5),
-            ("6285", "啟碁", "上市", 138.0, 3600, 11.4, 5.8, 1.8),
-            ("2301", "光寶科", "上市", 108.0, 7200, 13.6, 5.1, 2.6),
+
+    # 3. 若全市場真實抓取失敗，直接提醒使用者，不再混用 30 檔假資料
+    if full_df.empty or len(full_df) < 50:
+        st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線或稍後再試。")
+        st.stop()
+
+    # 4. 成功取得全市場資料，寫入 Parquet 與最新日期 Meta
+    try:
+        save_cols = [
+            "stock_id", "stock_name", "market", "close", 
+            "volume_sheets", "pe_ratio", "dividend_yield", "pb_ratio"
         ]
-        full_df = pd.DataFrame(fallback_data, columns=["stock_id", "stock_name", "market", "close", "volume_sheets", "pe_ratio", "dividend_yield", "pb_ratio"])
-        
+        temp_file = CACHE_PARQUET_FILE + ".tmp"
+        full_df[save_cols].to_parquet(temp_file, compression="snappy", index=False)
+        if os.path.exists(CACHE_PARQUET_FILE):
+            os.remove(CACHE_PARQUET_FILE)
+        os.rename(temp_file, CACHE_PARQUET_FILE)
+        with open(META_JSON_FILE, "w", encoding="utf-8") as f:
+            json.dump({"trading_date_label": required_date_label}, f)
+    except Exception:
+        pass
+
     full_df["themes"] = full_df["stock_id"].apply(get_stock_themes)
-    return full_df, is_fallback, source_type, trading_date_label
+    return full_df, required_date_label
 
 # ==========================================
 # 4. 第一階段漏斗初篩 (Top 25)
@@ -352,7 +312,6 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25)
 # ==========================================
 # 5. 第二階段：精準技術指標與價位運算
 # ==========================================
-@st.cache_data(ttl=1800, show_spinner=False)
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
     history_dict = {}
     enriched_rows = []
@@ -661,7 +620,6 @@ def get_single_stock_metrics(row_match, lookback_days):
     mid_buy_high = round(max(last_ma20, last_close - 0.8 * last_atr), 2)
     mid_target = round(last_close + 4.5 * last_atr, 2)
     
-    # 建立與精選股票總覽表格一模一樣結構的 DataFrame (10 欄寬結構)[cite: 1]
     table_df = pd.DataFrame([{
         "代號": sid,
         "名稱": row_match["stock_name"],
@@ -786,19 +744,13 @@ with st.sidebar:
     if os.path.exists(CACHE_PARQUET_FILE):
         mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
         mtime_str = mtime.strftime("%Y-%m-%d %H:%M")
-        is_latest = is_parquet_cache_valid_with_holidays(CACHE_PARQUET_FILE)
         cache_size = os.path.getsize(CACHE_PARQUET_FILE) / 1024.0
-
-        if is_latest:
-            st.caption(f"🟢 **狀態：已是最新盤後資料**\n• 快取更新時間：`{mtime_str}`\n• 檔案大小：`{cache_size:.1f} KB`")
-        else:
-            st.caption(f"🟡 **狀態：待更新盤後資料**\n• 目前快取：`{mtime_str}`\n• 系統將於下次查詢時自動同步")
+        st.caption(f"• 本地快取：`{CACHE_PARQUET_FILE}`\n• 建立時間：`{mtime_str}`\n• 檔案大小：`{cache_size:.1f} KB`")
     else:
         st.caption("⚪ 快取尚未建立")
         
     if st.button("🔄 強制重新抓取並更新快取", use_container_width=True):
         st.session_state.force_refresh_cache = True
-        st.cache_data.clear()
         st.rerun()
 
 current_config_key = f"{use_fund}_{lvl_fund}_{use_tech}_{lvl_tech}_{use_mkt}_{lvl_mkt}_{use_theme}_{lvl_theme}_{st.session_state.theme_last_update}"
@@ -806,13 +758,13 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 執行兩階段篩選引擎 (取得動態最新資料基準日標籤)
-with st.spinner("🚀 正在載入全市場大數據（優先讀取 Parquet 磁碟快取）並計算 K 線指標..."):
+# 執行全市場載入 (嚴格比對最新交易日)
+with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
     force_run = st.session_state.force_refresh_cache
-    full_universe_df, is_fallback_mode, data_src, data_trading_date = fetch_full_market_universe(force_refresh=force_run)
+    full_universe_df, data_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
-        st.toast("✅ 已強制向官方更新最新盤後資料並寫入 Parquet 快取！")
+        st.toast("✅ 已向官方重新同步最新盤後資料並寫入快取！")
 
     selections = {
         "fundamental": {"enabled": use_fund, "level": lvl_fund},
@@ -847,11 +799,6 @@ with col_stock_btn_2:
         show_single_stock_analysis_modal(full_universe_df, lookback, data_trading_date)
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 
-if is_fallback_mode:
-    st.warning("⚠️ **目前為離線備援資料模式**：官方 OpenAPI 連線異常或處於伺服器維護時段，系統已自動啟用內建基準資料供操作示範，待連線恢復後將自動同步全市場即時數據。")
-elif data_src == "parquet_disk":
-    st.caption("⚡ **資料狀態**：已成功自本地 `market_cache.parquet` 快速載入（0 延遲，不佔用 API 配額）。")
-
 batch_size = 5
 total_batches = max(1, int(np.ceil(len(ranked_df) / batch_size)))
 current_page = st.session_state.batch_page % total_batches
@@ -873,7 +820,7 @@ with col_btn2:
         st.session_state.batch_page = 0
         st.rerun()
 
-# 置頂總覽表格 (如附圖結構)[cite: 1]
+# 置頂總覽表格 (10 欄寬結構)[cite: 1]
 overview_merge = pd.merge(
     current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
     stock_bt_df[["代號", f"近{lookback}日報酬(%)", "月線順勢勝率(%)"]],
@@ -924,10 +871,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.divider()
-tab_bt, tab_detail, tab_verify = st.tabs([
+tab_bt, tab_detail = st.tabs([
     "📊 推薦組合淨值曲線與風險指標", 
-    "📋 完整量化指標明細表", 
-    "🔍 官方 OpenAPI 即時連線驗證器"
+    "📋 完整量化指標明細表"
 ])
 
 with tab_bt:
@@ -950,15 +896,3 @@ with tab_detail:
         "rsi_14", "vol_ratio", "short_buy_range", "short_target", "mid_buy_range", "mid_target"
     ]
     st.dataframe(current_5_df[display_cols], use_container_width=True, hide_index=True)
-
-with tab_verify:
-    st.markdown("點擊下方按鈕可直接測試從 **證交所 (TWSE) 與櫃買中心 (TPEx) 官方 OpenAPI** 抓取全市場上市櫃普通股快照：")
-    if st.button("🚀 執行 TWSE / TPEx 官方 OpenAPI 連線驗證"):
-        with st.spinner("連線至 TWSE 與 TPEx OpenAPI 中..."):
-            try:
-                live_snap, fb, src, snap_date = fetch_full_market_universe(force_refresh=True)
-                mode_desc = "（離線備援資料）" if fb else "（即時官方 OpenAPI）"
-                st.success(f"驗證成功！資料基準日：{snap_date}，共取得 {len(live_snap)} 檔有效流動性普通股 {mode_desc}。")
-                st.dataframe(live_snap.head(15), use_container_width=True, hide_index=True)
-            except Exception as e:
-                st.error(f"連線發生例外：{e}")
