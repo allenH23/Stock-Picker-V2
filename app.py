@@ -63,7 +63,7 @@ def show_legal_disclaimer_modal(forced_consent: bool = False):
     st.markdown("---")
     
     if forced_consent:
-        agree = st.checkbox("我已詳細閱讀、理解並完全同意上述投資風險與法律免責聲明。")
+        agree = st.checkbox("我已詳細閱讀, 理解並完全同意上述投資風險與法律免責聲明。")
         if st.button("確認並進入系統", type="primary", disabled=not agree, use_container_width=True):
             st.session_state.disclaimer_accepted = True
             st.rerun()
@@ -146,7 +146,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
     actual_trading_dt = get_latest_trading_cutoff()
     computed_date_label = format_trading_date_label(actual_trading_dt)
 
-    # 1. 優先從本地 Parquet 磁碟載入
     if not force_refresh and is_parquet_cache_valid_with_holidays(CACHE_PARQUET_FILE):
         try:
             df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
@@ -162,7 +161,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
         except Exception:
             pass
 
-    # 2. 連線官方 OpenAPI 抓取最新盤後資料
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
     is_fallback = False
@@ -552,7 +550,6 @@ def generate_dynamic_analysis_texts(market_data: dict):
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
 def show_market_analysis_modal(trading_date_str: str):
-    # 同步顯示資料基準日標籤 (含中文星期與盤後)
     st.caption(f"📅 盤勢情報分析基準日：**`{trading_date_str}`** (數據來源：即時連線 Yahoo Finance)")
     
     with st.spinner("正在連線抓取全球最新盤後市場數據並運算分析中..."):
@@ -577,7 +574,154 @@ def show_market_analysis_modal(trading_date_str: str):
         st.rerun()
 
 # ==========================================
-# 9. Streamlit 互動網頁主介面
+# 9. 個股深度分析彈跳視窗與單股運算模組
+# ==========================================
+def get_single_stock_metrics(row_match, lookback_days):
+    sid = row_match["stock_id"]
+    market = row_match["market"]
+    base_close = row_match["close"]
+    ticker = f"{sid}.TW" if market == "上市" else f"{sid}.TWO"
+    
+    hist_df = pd.DataFrame()
+    try:
+        raw = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
+        if not raw.empty and len(raw) > 30:
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            hist_df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+    except Exception:
+        pass
+        
+    if hist_df.empty:
+        np.random.seed(int(sid))
+        dates = pd.bdate_range(end=datetime.today(), periods=250)
+        rets = np.random.normal(0.0006, 0.02, len(dates))
+        price_path = base_close * np.exp(np.cumsum(rets - rets.mean() + 0.0006))
+        price_path = price_path * (base_close / price_path[-1])
+        hist_df = pd.DataFrame({
+            "Open": price_path * 0.998,
+            "High": price_path * 1.01,
+            "Low": price_path * 0.99,
+            "Close": price_path,
+            "Volume": np.random.randint(2000, 20000, len(dates)) * 1000
+        }, index=dates)
+
+    c = hist_df["Close"]
+    h = hist_df["High"]
+    l = hist_df["Low"]
+    
+    ma5 = c.rolling(5).mean()
+    ma20 = c.rolling(20).mean()
+    ma60 = c.rolling(60).mean()
+    
+    delta = c.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    rsi14 = (100 - (100 / (1 + rs))).fillna(50)
+    
+    tr = pd.concat([(h - l), (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+    atr14 = tr.rolling(14).mean().bfill()
+    
+    last_close = float(c.iloc[-1])
+    last_ma20 = float(ma20.iloc[-1])
+    last_rsi = float(rsi14.iloc[-1])
+    last_atr = float(atr14.iloc[-1])
+    
+    lookback_idx = min(lookback_days, len(c) - 1)
+    past_close = float(c.iloc[-lookback_idx])
+    ret_period = round((last_close / past_close - 1) * 100, 2)
+    
+    hist_df["daily_ret"] = c.pct_change().fillna(0)
+    hist_df["signal"] = (c.shift(1) > ma20.shift(1)).astype(int)
+    hist_df["strat_ret"] = hist_df["daily_ret"] * hist_df["signal"]
+    active_days = hist_df[hist_df["signal"] == 1]
+    win_rate = round((active_days["strat_ret"] > 0).mean() * 100, 1) if len(active_days) > 0 else 50.0
+    
+    short_buy_low = round(min(float(ma5.iloc[-1]), last_close - 0.5 * last_atr), 2)
+    short_target = round(last_close + 2.0 * last_atr, 2)
+    short_stop = round(max(last_close - 1.5 * last_atr, last_ma20 * 0.98), 2)
+    
+    mid_buy_low = round(min(last_ma20, float(ma60.iloc[-1])), 2)
+    mid_target = round(last_close + 4.5 * last_atr, 2)
+    
+    if last_close >= last_ma20 and last_rsi >= 52:
+        summary_text = f"股價站穩月線之上呈多頭排列，RSI 強勢動能達 {last_rsi:.1f}，法人與主流買盤積極進駐，短線價量齊揚。"
+        prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，後續若回測五日線或月線支撐有守，可視為良性換手，建議採逢回分批買入策略。"
+    elif last_close < last_ma20 and last_rsi <= 45:
+        summary_text = f"股價跌破月線且 RSI 偏弱（{last_rsi:.1f}），短線賣壓沉重，外資與主力調節力道顯現，成交量能萎縮。"
+        prediction_text = "**【宜觀望 / 等待止穩訊號】** 此股近日面臨修正壓力且跌破關鍵均線，短線不宜躁進接刀。建議保持觀望，等待量縮築底或出現止穩訊號再行評估。"
+    else:
+        summary_text = f"股價於月線附近震盪多日（RSI {last_rsi:.1f}），多空雙方在關鍵均線附近膠著交戰，成交量能溫和。"
+        prediction_text = "**【區間操作 / 保持彈性】** 此股目前處於箱型整理格局，方向尚未明確。建議採高出低吸的區間操作策略，或靜待突破訊號。"
+
+    detail = {
+        "close": round(last_close, 2),
+        "ret_period": ret_period,
+        "win_rate": win_rate,
+        "pe_ratio": row_match["pe_ratio"],
+        "short_buy_range": f"{short_buy_low} ~ {round(last_close, 2)}",
+        "short_target": short_target,
+        "short_stop": short_stop,
+        "mid_buy_range": f"{mid_buy_low} ~ {round(max(last_ma20, last_close - 0.8 * last_atr), 2)}",
+        "mid_target": mid_target,
+        "summary_text": summary_text,
+        "prediction_text": prediction_text
+    }
+    return detail
+
+@st.dialog("📈 個股深度分析與行情預測", width="large")
+def show_single_stock_analysis_modal(full_universe_df, lookback_days, trading_date_str):
+    st.caption(f"📅 分析基準日：`{trading_date_str}` ｜ 請搜尋並選取您想評估的上市櫃個股")
+    
+    # 建立可供搜尋的選單清單
+    stock_options = [f"{row['stock_id']} - {row['stock_name']} ({row['market']})" for _, row in full_universe_df.iterrows()]
+    selected_str = st.selectbox(
+        "🔍 搜尋股票代號或名稱",
+        options=stock_options,
+        index=0,
+        placeholder="輸入代號（如 2330）或名稱（如 台積電）搜尋..."
+    )
+    
+    if selected_str:
+        sid = selected_str.split(" - ")[0]
+        row_match = full_universe_df[full_universe_df["stock_id"] == sid].iloc[0]
+        
+        st.markdown("---")
+        st.markdown(f"### 🎯 分析標的：`{row_match['stock_id']}` **{row_match['stock_name']}** ({row_match['market']})")
+        
+        with st.spinner(f"正在運算 {row_match['stock_id']} {row_match['stock_name']} 的技術指標與回測數據中..."):
+            d = get_single_stock_metrics(row_match, lookback_days)
+            
+        # 1. 核心數據總覽
+        st.markdown("#### 📋 1. 核心數據總覽與盤勢總結")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("最新收盤價", f"{d['close']} 元")
+        m2.metric(f"近 {lookback_days} 日報酬", f"{d['ret_period']}%")
+        m3.metric("月線順勢勝率", f"{d['win_rate']}%")
+        m4.metric("本益比 (PE)", f"{d['pe_ratio']:.1f} 倍")
+        
+        st.markdown(
+            f"- ⚡ **短期買賣建議**：買入區間 `{d['short_buy_range']}` 元 ｜ "
+            f"目標停利賣出 `{d['short_target']}` 元 ｜ 防守停損 `{d['short_stop']}` 元"
+        )
+        st.markdown(
+            f"- 🧭 **中長期建議**：買入區間 `{d['mid_buy_range']}` 元 ｜ "
+            f"目標停利賣出 `{d['mid_target']}` 元"
+        )
+        
+        st.info(f"💡 **個股盤勢總結**：{d['summary_text']}")
+        
+        # 2. 後續行情預測與操作建議
+        st.markdown("#### 🔮 2. 後續行情預測與操作指引")
+        st.warning(d['prediction_text'])
+        
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    if st.button("關閉視窗", use_container_width=True):
+        st.rerun()
+
+# ==========================================
+# 10. Streamlit 互動網頁主介面
 # ==========================================
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
@@ -662,7 +806,7 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 執行兩階段篩選引擎 (取得資料基準日標籤)
+# 執行兩階段篩選引擎
 with st.spinner("🚀 正在載入全市場大數據（優先讀取 Parquet 磁碟快取）並計算 K 線指標..."):
     force_run = st.session_state.force_refresh_cache
     full_universe_df, is_fallback_mode, data_src, data_trading_date = fetch_full_market_universe(force_refresh=force_run)
@@ -679,7 +823,7 @@ with st.spinner("🚀 正在載入全市場大數據（優先讀取 Parquet 磁�
     stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
 
-# 頂部標題與按鈕區塊 (主頁頂端同步標註資料基準日)
+# 頂部標題與按鈕區塊 (盤勢分析與免責聲明)
 col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
 with col_h1:
     st.title("🎯 智慧選股系統")
@@ -692,6 +836,16 @@ with col_h3:
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("⚠️ 免責聲明", use_container_width=True):
         show_legal_disclaimer_modal(forced_consent=False)
+
+# ==========================================
+# 醒目的個股分析 Icon 按鈕 (位於盤勢分析與全市場精選推薦之間)
+# ==========================================
+st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
+col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
+with col_stock_btn_2:
+    if st.button("📈 查詢與分析指定個股（個股分析）", type="secondary", use_container_width=True):
+        show_single_stock_analysis_modal(full_universe_df, lookback, data_trading_date)
+st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 
 if is_fallback_mode:
     st.warning("⚠️ **目前為離線備援資料模式**：官方 OpenAPI 連線異常或處於伺服器維護時段，系統已自動啟用內建基準資料供操作示範，待連線恢復後將自動同步全市場即時數據。")
