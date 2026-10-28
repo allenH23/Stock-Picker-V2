@@ -19,7 +19,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 注入自訂 CSS：放大漢堡選單、增加法律橫幅、設定個股分析按鈕為亮眼藍色
+# 注入自訂 CSS：確保按鈕底色一定能變藍色
 st.markdown("""
     <style>
     [data-testid="collapsedControl"] {
@@ -39,21 +39,20 @@ st.markdown("""
         margin-top: 25px;
         margin-bottom: 25px;
     }
-    /* 個股分析專屬藍色按鈕樣式 */
-    div.stock-analysis-btn > button {
+    /* 強制將個股分析按鈕區塊設為顯眼藍底白字 */
+    div[data-testid="stHorizontalBlock"] button[kind="secondary"] {
         background-color: #1a73e8 !important;
         color: #ffffff !important;
-        border: none !important;
-        font-weight: 600 !important;
+        border: 1px solid #1a73e8 !important;
+        font-weight: 700 !important;
         font-size: 1.05rem !important;
-        padding: 10px 20px !important;
         border-radius: 8px !important;
-        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.3) !important;
-        transition: all 0.2s ease-in-out !important;
+        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35) !important;
     }
-    div.stock-analysis-btn > button:hover {
+    div[data-testid="stHorizontalBlock"] button[kind="secondary"]:hover {
         background-color: #1557b0 !important;
-        box-shadow: 0 4px 10px rgba(21, 87, 176, 0.4) !important;
+        border-color: #1557b0 !important;
+        color: #ffffff !important;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -118,7 +117,7 @@ def refresh_market_themes():
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # ==========================================
-# 2. 台股開盤日、連假休市與動態基準日標籤計算 (修正換日不更新問題)
+# 2. 台股開盤日、連假休市與動態基準日計算
 # ==========================================
 def is_tw_market_holiday(target_date: datetime.date) -> bool:
     if target_date.weekday() >= 5:
@@ -136,9 +135,11 @@ def get_latest_trading_cutoff(now: datetime = None) -> datetime:
     today_date = now.date()
     today_cutoff = datetime.combine(today_date, dtime(16, 30, 0))
 
+    # 若今天不是假日且已經過 16:30，基準日就是今天
     if not is_tw_market_holiday(today_date) and now >= today_cutoff:
         return today_cutoff
 
+    # 否則往前回推最後一個有效交易日
     check_date = today_date - timedelta(days=1)
     while is_tw_market_holiday(check_date):
         check_date -= timedelta(days=1)
@@ -159,11 +160,10 @@ def is_parquet_cache_valid_with_holidays(file_path: str) -> bool:
 # 3. 第一階段：具備 Parquet 磁碟快取的全市場資料獲取模組
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
-    # 即時依當前時間計算動態基準日（確保換日自動生效）
     actual_trading_dt = get_latest_trading_cutoff()
     computed_date_label = format_trading_date_label(actual_trading_dt)
 
-    # 1. 優先從本地 Parquet 磁碟載入
+    # 1. 檢查本地快取是否真的滿足當前最新交易日
     if not force_refresh and is_parquet_cache_valid_with_holidays(CACHE_PARQUET_FILE):
         try:
             df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
@@ -559,7 +559,7 @@ def generate_dynamic_analysis_texts(market_data: dict):
     return today_summary, tomorrow_pred
 
 # ==========================================
-# 8. 盤勢分析與預測彈跳視窗 (同步顯示最新資料基準日)
+# 8. 盤勢分析與預測彈跳視窗
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
 def show_market_analysis_modal(trading_date_str: str):
@@ -653,17 +653,15 @@ def get_single_stock_metrics(row_match, lookback_days):
     active_days = hist_df[hist_df["signal"] == 1]
     win_rate = round((active_days["strat_ret"] > 0).mean() * 100, 1) if len(active_days) > 0 else 50.0
     
-    # 計算買賣區間 (與精選表格完全一致)
     short_buy_low = round(min(last_ma5, last_close - 0.5 * last_atr), 2)
     short_buy_high = round(last_close, 2)
     short_target = round(last_close + 2.0 * last_atr, 2)
-    short_stop = round(max(last_close - 1.5 * last_atr, last_ma20 * 0.98), 2)
     
     mid_buy_low = round(min(last_ma20, last_ma60), 2)
     mid_buy_high = round(max(last_ma20, last_close - 0.8 * last_atr), 2)
     mid_target = round(last_close + 4.5 * last_atr, 2)
     
-    # 建立與精選股票總覽表格一模一樣結構的 DataFrame
+    # 建立與精選股票總覽表格一模一樣結構的 DataFrame (10 欄寬結構)[cite: 1]
     table_df = pd.DataFrame([{
         "代號": sid,
         "名稱": row_match["stock_name"],
@@ -677,7 +675,6 @@ def get_single_stock_metrics(row_match, lookback_days):
         "中長目標賣出": mid_target
     }])
 
-    # 簡單總結
     if last_close >= last_ma20 and last_rsi >= 52:
         summary_text = f"股價站穩月線之上呈多頭排列，RSI 強勢動能達 {last_rsi:.1f}，法人與主力買盤積極進駐，短線價量配合良好。"
         prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，後續若回測五日線或月線支撐有守，可視為良性換手，建議採逢回分批買入策略。"
@@ -712,12 +709,10 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days, trading_da
         with st.spinner(f"正在運算 {row_match['stock_id']} {row_match['stock_name']} 的量化指標與買賣建議..."):
             stock_table_df, summary_text, prediction_text = get_single_stock_metrics(row_match, lookback_days)
             
-        # 1. 核心數據總覽 (完全參考附圖表格結構)
         st.markdown("#### 📋 1. 個股核心數據總覽")
         st.dataframe(stock_table_df, use_container_width=True, hide_index=True)
         st.info(f"💡 **個股盤勢總結**：{summary_text}")
         
-        # 2. 後續行情預測與操作建議
         st.markdown("#### 🔮 2. 後續行情預測與操作指引")
         st.warning(prediction_text)
         
@@ -843,15 +838,13 @@ with col_h3:
         show_legal_disclaimer_modal(forced_consent=False)
 
 # ==========================================
-# 醒目的個股分析 Icon 按鈕 (底色換成科技藍色，位於盤勢分析與精選推薦之間)
+# 醒目的個股分析按鈕 (亮藍色底色，介於盤勢分析與精選推薦之間)
 # ==========================================
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
 with col_stock_btn_2:
-    st.markdown('<div class="stock-analysis-btn">', unsafe_allow_html=True)
-    if st.button("📈 查詢與分析指定個股（個股分析）", use_container_width=True):
+    if st.button("📈 查詢與分析指定個股（個股分析）", key="btn_single_stock_analysis", use_container_width=True):
         show_single_stock_analysis_modal(full_universe_df, lookback, data_trading_date)
-    st.markdown('</div>', unsafe_allow_html=True)
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 
 if is_fallback_mode:
@@ -880,7 +873,7 @@ with col_btn2:
         st.session_state.batch_page = 0
         st.rerun()
 
-# 置頂總覽表格 (如附圖結構)
+# 置頂總覽表格 (如附圖結構)[cite: 1]
 overview_merge = pd.merge(
     current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
     stock_bt_df[["代號", f"近{lookback}日報酬(%)", "月線順勢勝率(%)"]],
