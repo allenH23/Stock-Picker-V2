@@ -4,7 +4,7 @@ import numpy as np
 import requests
 import yfinance as yf
 import plotly.graph_objects as go
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 import re
 import os
 import json
@@ -18,6 +18,7 @@ st.set_page_config(
     layout="wide"
 )
 
+# 注入自訂 CSS：精準將個股分析按鈕鎖定為亮藍色底色
 st.markdown("""
     <style>
     [data-testid="collapsedControl"] {
@@ -37,8 +38,10 @@ st.markdown("""
         margin-top: 25px;
         margin-bottom: 25px;
     }
-    /* 個股分析按鈕純原生藍底樣式 */
-    div.row-widget.stButton button[kind="secondary"] {
+    /* 強制將包含「個股分析」文字的按鈕套用顯眼科技藍底色 */
+    button:has(p:contains("個股分析")), 
+    button[key="btn_single_stock_analysis"],
+    div.stButton > button:has(div:contains("個股分析")) {
         background-color: #1a73e8 !important;
         color: #ffffff !important;
         border: 1px solid #1a73e8 !important;
@@ -47,7 +50,8 @@ st.markdown("""
         border-radius: 8px !important;
         box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35) !important;
     }
-    div.row-widget.stButton button[kind="secondary"]:hover {
+    button:has(p:contains("個股分析")):hover,
+    button[key="btn_single_stock_analysis"]:hover {
         background-color: #1557b0 !important;
         border-color: #1557b0 !important;
         color: #ffffff !important;
@@ -114,62 +118,50 @@ def refresh_market_themes():
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # ==========================================
-# 2. 精準台股開盤日、連假休市與動態基準日計算
+# 2. 以「台股證交所真實資料時間」作為基準日轉換函式
 # ==========================================
-def is_tw_market_holiday(target_date: datetime.date) -> bool:
-    if target_date.weekday() >= 5:
-        return True
-    TW_HOLIDAYS_SET = {
-        "2026-01-01", "2026-02-13", "2026-02-16", "2026-02-17", "2026-02-18",
-        "2026-02-19", "2026-02-20", "2026-02-27", "2026-04-03", "2026-04-06",
-        "2026-05-01", "2026-06-19", "2026-09-25", "2026-10-09"
-    }
-    return target_date.strftime("%Y-%m-%d") in TW_HOLIDAYS_SET
-
-def get_latest_trading_cutoff(now: datetime = None) -> datetime:
-    if now is None:
-        now = datetime.now()
-    today_date = now.date()
-    today_cutoff = datetime.combine(today_date, dtime(16, 30, 0))
-
-    if not is_tw_market_holiday(today_date) and now >= today_cutoff:
-        return today_cutoff
-
-    check_date = today_date - timedelta(days=1)
-    while is_tw_market_holiday(check_date):
-        check_date -= timedelta(days=1)
-    return datetime.combine(check_date, dtime(16, 30, 0))
-
-def format_trading_date_label(dt: datetime) -> str:
+def parse_tw_roc_date(roc_date_str: str) -> str:
+    """將證交所民國年日期字串 (如 '1151028' 或 '115/10/28') 轉換為標準西元年與中文星期"""
     weekday_map = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
-    return f"{dt.strftime('%Y-%m-%d')} {weekday_map.get(dt.weekday(), '')} 盤後"
+    try:
+        clean = re.sub(r"[^\d]", "", str(roc_date_str))
+        if len(clean) >= 7:
+            year = int(clean[:3]) + 1911
+            month = int(clean[3:5])
+            day = int(clean[5:7])
+            dt = datetime(year, month, day)
+            return f"{dt.strftime('%Y-%m-%d')} {weekday_map.get(dt.weekday(), '')} 盤後"
+    except Exception:
+        pass
+    # 若無回傳日期則依台灣時區回傳預設日期
+    tw_now = datetime.utcnow() + timedelta(hours=8)
+    return f"{tw_now.strftime('%Y-%m-%d')} {weekday_map.get(tw_now.weekday(), '')} 盤後"
 
 # ==========================================
-# 3. 第一階段：全市場真實數據擷取與 Parquet 快取 (取消30檔備援資料)
+# 3. 第一階段：全市場真實數據擷取與 Parquet 快取 (純真實連線，無測試假資料)
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
-    actual_trading_dt = get_latest_trading_cutoff()
-    required_date_label = format_trading_date_label(actual_trading_dt)
-
-    # 1. 比對 Meta JSON 與 Parquet 快取是否存在且屬於「目標交易日」
+    # 1. 優先檢查快取檔案與中繼檔是否存在
     if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
             with open(META_JSON_FILE, "r", encoding="utf-8") as f:
                 meta_info = json.load(f)
             cached_label = meta_info.get("trading_date_label", "")
             
-            # 若快取內的日期標籤正好等於今日應有的最新交易日，直接秒讀
-            if cached_label == required_date_label:
+            # 檔案修改時間是否在 12 小時內
+            mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
+            if (datetime.now() - mtime).total_seconds() < 43200 and cached_label:
                 df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
                 if not df_cached.empty and len(df_cached) >= 50:
                     df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
-                    return df_cached, required_date_label
+                    return df_cached, cached_label
         except Exception:
             pass
 
-    # 2. 快取過期或不存在：向 TWSE / TPEx OpenAPI 抓取最新真實資料
+    # 2. 抓取 TWSE / TPEx 官方即時盤後真實數據
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
+    twse_raw_date_str = ""
 
     pe_twse = {}
     try:
@@ -178,6 +170,9 @@ def fetch_full_market_universe(force_refresh: bool = False):
             for row in r_pe.json():
                 code = str(row.get("Code", "")).strip()
                 if re.match(r"^[1-9]\d{3}$", code):
+                    # 擷取官方回傳的實際交易日期欄位
+                    if not twse_raw_date_str and "Date" in row:
+                        twse_raw_date_str = str(row["Date"])
                     pe_twse[code] = {
                         "name": row.get("Name", "").strip(),
                         "pe": pd.to_numeric(str(row.get("PEratio", "")).replace(",", ""), errors="coerce"),
@@ -192,6 +187,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
         if r_p.status_code == 200:
             for row in r_p.json():
                 code = str(row.get("Code", "")).strip()
+                if not twse_raw_date_str and "Date" in row:
+                    twse_raw_date_str = str(row["Date"])
                 if code in pe_twse:
                     vol_shares = pd.to_numeric(str(row.get("TradeVolume", "")).replace(",", ""), errors="coerce")
                     close_p = pd.to_numeric(str(row.get("ClosingPrice", "")).replace(",", ""), errors="coerce")
@@ -252,12 +249,14 @@ def fetch_full_market_universe(force_refresh: bool = False):
 
     full_df = pd.DataFrame(market_rows)
 
-    # 3. 若全市場真實抓取失敗，直接提醒使用者，不再混用 30 檔假資料
     if full_df.empty or len(full_df) < 50:
         st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線或稍後再試。")
         st.stop()
 
-    # 4. 成功取得全市場資料，寫入 Parquet 與最新日期 Meta
+    # 3. 以台股官方資料傳回的真實日期為準
+    actual_trading_date_label = parse_tw_roc_date(twse_raw_date_str)
+
+    # 4. 存檔與記錄 Meta
     try:
         save_cols = [
             "stock_id", "stock_name", "market", "close", 
@@ -269,12 +268,12 @@ def fetch_full_market_universe(force_refresh: bool = False):
             os.remove(CACHE_PARQUET_FILE)
         os.rename(temp_file, CACHE_PARQUET_FILE)
         with open(META_JSON_FILE, "w", encoding="utf-8") as f:
-            json.dump({"trading_date_label": required_date_label}, f)
+            json.dump({"trading_date_label": actual_trading_date_label}, f)
     except Exception:
         pass
 
     full_df["themes"] = full_df["stock_id"].apply(get_stock_themes)
-    return full_df, required_date_label
+    return full_df, actual_trading_date_label
 
 # ==========================================
 # 4. 第一階段漏斗初篩 (Top 25)
@@ -546,7 +545,7 @@ def show_market_analysis_modal(trading_date_str: str):
         st.rerun()
 
 # ==========================================
-# 9. 個股深度分析彈跳視窗 (完全比照附圖精選股票總覽表格結構)
+# 9. 個股深度分析彈跳視窗 (預設空白搜尋框 + 附圖 10 欄寬結構)
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
     sid = row_match["stock_id"]
@@ -620,6 +619,7 @@ def get_single_stock_metrics(row_match, lookback_days):
     mid_buy_high = round(max(last_ma20, last_close - 0.8 * last_atr), 2)
     mid_target = round(last_close + 4.5 * last_atr, 2)
     
+    # 建立 10 欄寬度的結構
     table_df = pd.DataFrame([{
         "代號": sid,
         "名稱": row_match["stock_name"],
@@ -650,11 +650,13 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days, trading_da
     st.caption(f"📅 資料基準日：**`{trading_date_str}`** ｜ 請搜尋並選取您想評估的上市櫃個股")
     
     stock_options = [f"{row['stock_id']} - {row['stock_name']} ({row['market']})" for _, row in full_universe_df.iterrows()]
+    
+    # 修改 1：預設不選取任何股票，保持完全空白
     selected_str = st.selectbox(
         "🔍 搜尋股票代號或名稱",
         options=stock_options,
-        index=0,
-        placeholder="輸入代號（如 2330）或名稱（如 台積電）搜尋..."
+        index=None,
+        placeholder="請輸入股票代號（如 2330）或名稱（如 台積電）搜尋..."
     )
     
     if selected_str:
@@ -673,6 +675,8 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days, trading_da
         
         st.markdown("#### 🔮 2. 後續行情預測與操作指引")
         st.warning(prediction_text)
+    else:
+        st.info("👆 請於上方輸入框輸入股票代號或名稱，選取後系統將自動開始量化運算並產出買賣指引。")
         
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("關閉視窗", use_container_width=True):
@@ -758,7 +762,7 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 執行全市場載入 (嚴格比對最新交易日)
+# 執行全市場載入 (以台股官方真實日期為準)
 with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
     force_run = st.session_state.force_refresh_cache
     full_universe_df, data_trading_date = fetch_full_market_universe(force_refresh=force_run)
