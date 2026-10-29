@@ -18,7 +18,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 注入自訂 CSS：穿透設定個股分析按鈕為亮藍底色與白字
+# 注入自訂 CSS：精確鎖定個股分析按鈕為亮藍底色與白字
 st.markdown("""
     <style>
     [data-testid="collapsedControl"] {
@@ -38,28 +38,34 @@ st.markdown("""
         margin-top: 25px;
         margin-bottom: 25px;
     }
-    /* 核心藍色按鈕樣式穿透 (使用最高權重 ID 選擇器) */
-    #single-stock-btn-wrapper button {
+    /* 透過 Streamlit 原生 key class 與標準 aria-label 選擇器雙重鎖定亮藍底色 */
+    div.st-key-btn_single_stock_analysis button,
+    button[aria-label*="個股分析"] {
         background-color: #1a73e8 !important;
         background: #1a73e8 !important;
         color: #ffffff !important;
         border: 1px solid #1a73e8 !important;
         border-radius: 8px !important;
-        box-shadow: 0 4px 10px rgba(26, 115, 232, 0.4) !important;
+        box-shadow: 0 4px 10px rgba(26, 115, 232, 0.35) !important;
         transition: all 0.2s ease-in-out !important;
     }
-    #single-stock-btn-wrapper button p {
+    div.st-key-btn_single_stock_analysis button p,
+    div.st-key-btn_single_stock_analysis button span,
+    button[aria-label*="個股分析"] p,
+    button[aria-label*="個股分析"] span {
         color: #ffffff !important;
         font-weight: 700 !important;
-        font-size: 1.08rem !important;
+        font-size: 1.05rem !important;
     }
-    #single-stock-btn-wrapper button:hover {
+    div.st-key-btn_single_stock_analysis button:hover,
+    button[aria-label*="個股分析"]:hover {
         background-color: #1557b0 !important;
         background: #1557b0 !important;
         border-color: #1557b0 !important;
-        box-shadow: 0 6px 14px rgba(21, 87, 176, 0.5) !important;
+        box-shadow: 0 6px 14px rgba(21, 87, 176, 0.45) !important;
     }
-    #single-stock-btn-wrapper button:hover p {
+    div.st-key-btn_single_stock_analysis button:hover p,
+    button[aria-label*="個股分析"]:hover p {
         color: #ffffff !important;
     }
     </style>
@@ -257,9 +263,9 @@ def fetch_full_market_universe(force_refresh: bool = False):
     return full_df, actual_tw_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩 (Top 35 候選池)
+# 3. 第一階段漏斗初篩 (Top 25)
 # ==========================================
-def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35) -> pd.DataFrame:
+def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
     df = full_df.copy()
     df["stage1_score"] = 0.0
 
@@ -290,7 +296,7 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35)
     return ranked_pool
 
 # ==========================================
-# 4. 狀態聯動動態定價模型
+# 4. 狀態聯動動態定價模型 (不否決個股，客觀計算買賣價與指引)
 # ==========================================
 def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr):
     is_bull = (last_close >= last_ma20) and (last_rsi >= 50)
@@ -311,11 +317,11 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         mid_target = round(last_close + 4.5 * last_atr, 2)
         mid_stop = round(last_ma60 * 0.97, 2)
 
-        summary_text = f"股價站穩月線之上呈多頭排列，RSI 動能達 {last_rsi:.1f}，法人與主力買盤積極進駐，短線價量配合良好。"
+        summary_text = f"股價站穩月線之上呈多頭排列，RSI 動能達 {last_rsi:.1f}，法人與主流買盤進駐，短線價量配合良好。"
         prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，建議待股價小幅回測五日線或月線支撐不破時，採逢回分批承接策略。"
-        is_recommendable = True
 
     elif is_bear:
+        # 空頭修正狀態：買入價位標示為下方測撐區，不將現價列為買入上緣
         short_buy_low = round(last_close - 1.8 * last_atr, 2)
         short_buy_high = round(last_close - 1.0 * last_atr, 2)
         short_buy_range = f"{short_buy_low} ~ {short_buy_high} (測撐區)"
@@ -330,8 +336,6 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
 
         summary_text = f"近日賣壓沉重，外資與主力連續調節，股價跌破關鍵月線且 RSI 偏弱（{last_rsi:.1f}），短線進入弱勢修正。"
         prediction_text = "**【宜觀望 / 勿急於接刀】** 此股近日面臨修正壓力，現價風險較高。建議保持觀望，耐心等待股價回落至下方預估測撐區並出現止穩訊號再行評估。"
-        # 空頭接刀股直接標記為不可推薦，從精選 5 檔中剔除
-        is_recommendable = False
 
     else:
         short_buy_low = round(last_ma20 - 1.0 * last_atr, 2)
@@ -348,7 +352,6 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
 
         summary_text = f"已於月線附近區間震盪多日（RSI {last_rsi:.1f}），多空力量在此交戰拉鋸，成交量能溫和，靜待方向突破。"
         prediction_text = "**【區間操作 / 保持彈性】** 此股目前處於箱型整理格局，方向尚未明朗。切勿追高現價，建議在建議買入區間（箱型下緣）低接、接近目標價時獲利調節。"
-        is_recommendable = True
 
     return {
         "short_buy_range": short_buy_range,
@@ -358,12 +361,11 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         "mid_target": mid_target,
         "mid_stop": mid_stop,
         "summary_text": summary_text,
-        "prediction_text": prediction_text,
-        "is_recommendable": is_recommendable
+        "prediction_text": prediction_text
     }
 
 # ==========================================
-# 5. 第二階段：精準技術指標、硬性過濾與回測歷史運算
+# 5. 第二階段：精準技術指標與回測歷史運算 (保留所有合格股)
 # ==========================================
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
     history_dict = {}
@@ -431,10 +433,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
         
         pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
         
-        # 核心修正：若為空頭破線接刀股（is_recommendable == False），直接過濾不納入首頁精選推薦！
-        if not pricing["is_recommendable"]:
-            continue
-            
         hist_df["MA20"] = ma20
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
@@ -827,7 +825,7 @@ with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
         "market": {"enabled": use_mkt, "level": lvl_mkt},
         "theme": {"enabled": use_theme, "level": lvl_theme},
     }
-    stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=35)
+    stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
 
 # 頂部標題與按鈕區塊
@@ -845,15 +843,13 @@ with col_h3:
         show_legal_disclaimer_modal()
 
 # ==========================================
-# 醒目的個股分析按鈕 (使用專屬 Wrapper ID 穿透設定亮藍底色與白字)
+# 醒目的個股分析按鈕 (藍底白字，介於盤勢分析與精選推薦之間)
 # ==========================================
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
 with col_stock_btn_2:
-    st.markdown('<div id="single-stock-btn-wrapper">', unsafe_allow_html=True)
     if st.button("📈 查詢與分析指定個股（個股分析）", key="btn_single_stock_analysis", use_container_width=True):
         show_single_stock_analysis_modal(full_universe_df, lookback)
-    st.markdown('</div>', unsafe_allow_html=True)
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 
 batch_size = 5
