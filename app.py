@@ -7,7 +7,6 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import re
 import os
-import json
 
 # ==========================================
 # 頁面基本設定與手機版 UI 樣式優化
@@ -18,7 +17,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 注入自訂 CSS：精準將個股分析按鈕鎖定為亮藍色底色
+# 注入自訂 CSS：精準將個股分析按鈕強制鎖定為亮藍底色白字
 st.markdown("""
     <style>
     [data-testid="collapsedControl"] {
@@ -38,38 +37,35 @@ st.markdown("""
         margin-top: 25px;
         margin-bottom: 25px;
     }
-    /* 強制將包含「個股分析」文字的按鈕套用顯眼科技藍底色 */
-    button:has(p:contains("個股分析")), 
-    button[key="btn_single_stock_analysis"],
-    div.stButton > button:has(div:contains("個股分析")) {
+    /* 強制將個股分析按鈕鎖定為亮藍底色、白字 */
+    button[key="btn_single_stock_analysis"] {
         background-color: #1a73e8 !important;
-        color: #ffffff !important;
         border: 1px solid #1a73e8 !important;
+        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35) !important;
+        border-radius: 8px !important;
+    }
+    button[key="btn_single_stock_analysis"] p {
+        color: #ffffff !important;
         font-weight: 700 !important;
         font-size: 1.05rem !important;
-        border-radius: 8px !important;
-        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35) !important;
     }
-    button:has(p:contains("個股分析")):hover,
     button[key="btn_single_stock_analysis"]:hover {
         background-color: #1557b0 !important;
         border-color: #1557b0 !important;
+    }
+    button[key="btn_single_stock_analysis"]:hover p {
         color: #ffffff !important;
     }
     </style>
 """, unsafe_allow_html=True)
 
 CACHE_PARQUET_FILE = "market_cache.parquet"
-META_JSON_FILE = "market_cache_meta.json"
 
 # ==========================================
-# 0. App Store 合規免責聲明機制 (Dialog)
+# 0. 法律免責聲明彈窗 (僅供手動查閱，取消首次強制彈出)
 # ==========================================
-if "disclaimer_accepted" not in st.session_state:
-    st.session_state.disclaimer_accepted = False
-
 @st.dialog("⚖️ 投資風險與法律免責聲明", width="large")
-def show_legal_disclaimer_modal(forced_consent: bool = False):
+def show_legal_disclaimer_modal():
     st.markdown("### ⚠️ 使用者須知與風險宣告")
     st.markdown("""
     感謝您使用**「智慧選股系統」**（以下簡稱「本系統」）。在使用本系統提供的任何資訊、數據、指標及分析工具前，請仔細閱讀以下法律聲明：
@@ -79,18 +75,8 @@ def show_legal_disclaimer_modal(forced_consent: bool = False):
     3. **獨立審慎評估與風險自負**：本系統所引用之即時或盤後數據源自台灣證券交易所、證券櫃檯買賣中心及第三方資訊服務商，本系統力求數據之客觀與正確，但對數據延遲、遺漏或計算偏差不負法律保證責任。**使用者應依個人財務狀況、風險承受能力獨立判斷並自負投資盈虧責任**。
     """)
     st.markdown("---")
-    
-    if forced_consent:
-        agree = st.checkbox("我已詳細閱讀，理解並完全同意上述投資風險與法律免責聲明。")
-        if st.button("確認並進入系統", type="primary", disabled=not agree, use_container_width=True):
-            st.session_state.disclaimer_accepted = True
-            st.rerun()
-    else:
-        if st.button("關閉聲明", use_container_width=True):
-            st.rerun()
-
-if not st.session_state.disclaimer_accepted:
-    show_legal_disclaimer_modal(forced_consent=True)
+    if st.button("關閉聲明", use_container_width=True):
+        st.rerun()
 
 # ==========================================
 # 1. 熱門題材概念股字典與動態更新機制
@@ -118,50 +104,24 @@ def refresh_market_themes():
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 # ==========================================
-# 2. 以「台股證交所真實資料時間」作為基準日轉換函式
-# ==========================================
-def parse_tw_roc_date(roc_date_str: str) -> str:
-    """將證交所民國年日期字串 (如 '1151028' 或 '115/10/28') 轉換為標準西元年與中文星期"""
-    weekday_map = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
-    try:
-        clean = re.sub(r"[^\d]", "", str(roc_date_str))
-        if len(clean) >= 7:
-            year = int(clean[:3]) + 1911
-            month = int(clean[3:5])
-            day = int(clean[5:7])
-            dt = datetime(year, month, day)
-            return f"{dt.strftime('%Y-%m-%d')} {weekday_map.get(dt.weekday(), '')} 盤後"
-    except Exception:
-        pass
-    # 若無回傳日期則依台灣時區回傳預設日期
-    tw_now = datetime.utcnow() + timedelta(hours=8)
-    return f"{tw_now.strftime('%Y-%m-%d')} {weekday_map.get(tw_now.weekday(), '')} 盤後"
-
-# ==========================================
-# 3. 第一階段：全市場真實數據擷取與 Parquet 快取 (純真實連線，無測試假資料)
+# 2. 全市場真實數據擷取與 Parquet 磁碟快取
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
-    # 1. 優先檢查快取檔案與中繼檔是否存在
-    if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
+    # 1. 檢查本地快取是否存在且在 12 小時內
+    if not force_refresh and os.path.exists(CACHE_PARQUET_FILE):
         try:
-            with open(META_JSON_FILE, "r", encoding="utf-8") as f:
-                meta_info = json.load(f)
-            cached_label = meta_info.get("trading_date_label", "")
-            
-            # 檔案修改時間是否在 12 小時內
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
-            if (datetime.now() - mtime).total_seconds() < 43200 and cached_label:
+            if (datetime.now() - mtime).total_seconds() < 43200:
                 df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
                 if not df_cached.empty and len(df_cached) >= 50:
                     df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
-                    return df_cached, cached_label
+                    return df_cached
         except Exception:
             pass
 
-    # 2. 抓取 TWSE / TPEx 官方即時盤後真實數據
+    # 2. 連線官方 OpenAPI 抓取最新盤後資料
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
-    twse_raw_date_str = ""
 
     pe_twse = {}
     try:
@@ -170,9 +130,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
             for row in r_pe.json():
                 code = str(row.get("Code", "")).strip()
                 if re.match(r"^[1-9]\d{3}$", code):
-                    # 擷取官方回傳的實際交易日期欄位
-                    if not twse_raw_date_str and "Date" in row:
-                        twse_raw_date_str = str(row["Date"])
                     pe_twse[code] = {
                         "name": row.get("Name", "").strip(),
                         "pe": pd.to_numeric(str(row.get("PEratio", "")).replace(",", ""), errors="coerce"),
@@ -187,8 +144,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
         if r_p.status_code == 200:
             for row in r_p.json():
                 code = str(row.get("Code", "")).strip()
-                if not twse_raw_date_str and "Date" in row:
-                    twse_raw_date_str = str(row["Date"])
                 if code in pe_twse:
                     vol_shares = pd.to_numeric(str(row.get("TradeVolume", "")).replace(",", ""), errors="coerce")
                     close_p = pd.to_numeric(str(row.get("ClosingPrice", "")).replace(",", ""), errors="coerce")
@@ -253,10 +208,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
         st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線或稍後再試。")
         st.stop()
 
-    # 3. 以台股官方資料傳回的真實日期為準
-    actual_trading_date_label = parse_tw_roc_date(twse_raw_date_str)
-
-    # 4. 存檔與記錄 Meta
     try:
         save_cols = [
             "stock_id", "stock_name", "market", "close", 
@@ -267,16 +218,14 @@ def fetch_full_market_universe(force_refresh: bool = False):
         if os.path.exists(CACHE_PARQUET_FILE):
             os.remove(CACHE_PARQUET_FILE)
         os.rename(temp_file, CACHE_PARQUET_FILE)
-        with open(META_JSON_FILE, "w", encoding="utf-8") as f:
-            json.dump({"trading_date_label": actual_trading_date_label}, f)
     except Exception:
         pass
 
     full_df["themes"] = full_df["stock_id"].apply(get_stock_themes)
-    return full_df, actual_trading_date_label
+    return full_df
 
 # ==========================================
-# 4. 第一階段漏斗初篩 (Top 25)
+# 3. 第一階段漏斗初篩 (Top 25)
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
     df = full_df.copy()
@@ -309,7 +258,82 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25)
     return ranked_pool
 
 # ==========================================
-# 5. 第二階段：精準技術指標與價位運算
+# 4. 核心：狀態聯動動態定價與技術指標運算模型 (Regime-based Dynamic Pricing)
+# ==========================================
+def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr):
+    """
+    根據個股多空趨勢狀態，精準計算買賣建議價位，消除『指引建議觀望，買入價卻包含現價』的邏輯衝突
+    """
+    # 狀態判斷
+    is_bull = (last_close >= last_ma20) and (last_rsi >= 50)
+    is_bear = (last_close < last_ma20) and (last_rsi < 45)
+
+    if is_bull:
+        # 多頭強勢：拉回五日線支撐分批承接，不追在當日最高
+        short_buy_low = round(min(last_ma5 - 0.2 * last_atr, last_close - 0.4 * last_atr), 2)
+        short_buy_high = round(min(last_close, max(last_ma5, last_close - 0.1 * last_atr)), 2)
+        if short_buy_low >= short_buy_high:
+            short_buy_low = round(short_buy_high - 0.3 * last_atr, 2)
+        short_buy_range = f"{short_buy_low} ~ {short_buy_high}"
+        short_target = round(last_close + 2.0 * last_atr, 2)
+        short_stop = round(max(last_close - 1.5 * last_atr, last_ma20 * 0.98), 2)
+
+        mid_buy_low = round(last_ma20 * 0.99, 2)
+        mid_buy_high = round(last_ma20 * 1.02, 2)
+        mid_buy_range = f"{mid_buy_low} ~ {mid_buy_high}"
+        mid_target = round(last_close + 4.5 * last_atr, 2)
+        mid_stop = round(last_ma60 * 0.97, 2)
+
+        summary_text = f"股價站穩月線之上呈多頭排列，RSI 動能達 {last_rsi:.1f}，法人與主流買盤進駐，短線價量結構健康。"
+        prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，建議待股價小幅回測五日線或月線支撐不破時，採逢回分批承接策略。"
+
+    elif is_bear:
+        # 空頭修正：絕不將現價列為買入區間，設定深幅折價支撐區，防止接刀
+        short_buy_low = round(last_close - 1.8 * last_atr, 2)
+        short_buy_high = round(last_close - 1.0 * last_atr, 2)
+        short_buy_range = f"{short_buy_low} ~ {short_buy_high} (測撐區)"
+        short_target = round(last_close + 1.2 * last_atr, 2) # 反彈即停利
+        short_stop = round(last_close - 2.0 * last_atr, 2)
+
+        mid_buy_low = round(min(last_ma60 * 0.95, last_close - 2.5 * last_atr), 2)
+        mid_buy_high = round(min(last_ma60 * 0.98, last_close - 1.5 * last_atr), 2)
+        mid_buy_range = f"{mid_buy_low} ~ {mid_buy_high} (長線觀察)"
+        mid_target = round(last_close + 3.0 * last_atr, 2)
+        mid_stop = round(last_close - 2.8 * last_atr, 2)
+
+        summary_text = f"近日賣壓沉重，外資與主力連續調節，股價跌破關鍵月線且 RSI 偏弱（{last_rsi:.1f}），短線進入弱勢修正。"
+        prediction_text = "**【宜觀望 / 勿急於接刀】** 此股近日面臨修正壓力，現價風險較高。建議保持觀望，耐心等待股價回落至下方預估測撐區並出現止穩訊號再行評估。"
+
+    else:
+        # 箱型整理：限制在箱型下半部承接，不在中軸或頂部追價
+        short_buy_low = round(last_ma20 - 1.0 * last_atr, 2)
+        short_buy_high = round(last_ma20 - 0.3 * last_atr, 2)
+        short_buy_range = f"{short_buy_low} ~ {short_buy_high}"
+        short_target = round(last_close + 1.8 * last_atr, 2)
+        short_stop = round(last_ma20 - 1.4 * last_atr, 2)
+
+        mid_buy_low = round(min(last_ma20, last_ma60) - 0.5 * last_atr, 2)
+        mid_buy_high = round(min(last_ma20, last_ma60), 2)
+        mid_buy_range = f"{mid_buy_low} ~ {mid_buy_high}"
+        mid_target = round(last_close + 3.5 * last_atr, 2)
+        mid_stop = round(last_ma60 * 0.97, 2)
+
+        summary_text = f"已於月線附近區間震盪多日（RSI {last_rsi:.1f}），多空力量在此交戰拉鋸，成交量能溫和，靜待方向突破。"
+        prediction_text = "**【區間操作 / 保持彈性】** 此股目前處於箱型整理格局，方向尚未明朗。切勿追高現價，建議在建議買入區間（箱型下緣）低接、接近目標價時獲利調節。"
+
+    return {
+        "short_buy_range": short_buy_range,
+        "short_target": short_target,
+        "short_stop": short_stop,
+        "mid_buy_range": mid_buy_range,
+        "mid_target": mid_target,
+        "mid_stop": mid_stop,
+        "summary_text": summary_text,
+        "prediction_text": prediction_text
+    }
+
+# ==========================================
+# 5. 第二階段：精準技術指標與回測歷史運算
 # ==========================================
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
     history_dict = {}
@@ -375,15 +399,8 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
         vol_ratio = float(v.iloc[-1] / max(v.iloc[-6:-1].mean(), 1))
         ret_5d = float((c.iloc[-1] / c.iloc[-6] - 1) * 100) if len(c) >= 6 else 0.0
         
-        short_buy_low = round(min(last_ma5, last_close - 0.5 * last_atr), 2)
-        short_buy_high = round(last_close, 2)
-        short_sell_target = round(last_close + 2.0 * last_atr, 2)
-        short_stop_loss = round(max(last_close - 1.5 * last_atr, last_ma20 * 0.98), 2)
-        
-        mid_buy_low = round(min(last_ma20, last_ma60), 2)
-        mid_buy_high = round(max(last_ma20, last_close - 0.8 * last_atr), 2)
-        mid_sell_target = round(last_close + 4.5 * last_atr, 2)
-        mid_stop_loss = round(last_ma60 * 0.97, 2)
+        # 套用狀態聯動定價模型
+        pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
         
         hist_df["MA20"] = ma20
         hist_df["MA60"] = ma60
@@ -402,12 +419,12 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
             "rsi_14": round(last_rsi, 1),
             "vol_ratio": round(vol_ratio, 2),
             "ret_5d": round(ret_5d, 2),
-            "short_buy_range": f"{short_buy_low} ~ {short_buy_high}",
-            "short_target": short_sell_target,
-            "short_stop": short_stop_loss,
-            "mid_buy_range": f"{mid_buy_low} ~ {mid_buy_high}",
-            "mid_target": mid_sell_target,
-            "mid_stop": mid_stop_loss,
+            "short_buy_range": pricing["short_buy_range"],
+            "short_target": pricing["short_target"],
+            "short_stop": pricing["short_stop"],
+            "mid_buy_range": pricing["mid_buy_range"],
+            "mid_target": pricing["mid_target"],
+            "mid_stop": pricing["mid_stop"],
             "recommend_reason": reason,
             "final_score": row["stage1_score"] + (last_rsi * 0.3) + (15.0 if last_close >= last_ma20 else 0.0)
         })
@@ -468,7 +485,7 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 7. 動態市場數據抓取與智慧分析模組
+# 7. 即時國際指數抓取與大盤預測模組
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_live_market_data():
@@ -517,12 +534,10 @@ def generate_dynamic_analysis_texts(market_data: dict):
     return today_summary, tomorrow_pred
 
 # ==========================================
-# 8. 盤勢分析與預測彈跳視窗
+# 8. 盤勢分析與預測彈跳視窗 (已取消顯示日期)
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
-def show_market_analysis_modal(trading_date_str: str):
-    st.caption(f"📅 盤勢情報分析基準日：**`{trading_date_str}`** (數據來源：即時連線 Yahoo Finance)")
-    
+def show_market_analysis_modal():
     with st.spinner("正在連線抓取全球最新盤後市場數據並運算分析中..."):
         market_data = get_live_market_data()
         today_txt, tomorrow_txt = generate_dynamic_analysis_texts(market_data)
@@ -545,7 +560,7 @@ def show_market_analysis_modal(trading_date_str: str):
         st.rerun()
 
 # ==========================================
-# 9. 個股深度分析彈跳視窗 (預設空白搜尋框 + 附圖 10 欄寬結構)
+# 9. 個股深度分析彈跳視窗 (預設空白搜尋框 + 狀態聯動定價)
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
     sid = row_match["stock_id"]
@@ -611,15 +626,10 @@ def get_single_stock_metrics(row_match, lookback_days):
     active_days = hist_df[hist_df["signal"] == 1]
     win_rate = round((active_days["strat_ret"] > 0).mean() * 100, 1) if len(active_days) > 0 else 50.0
     
-    short_buy_low = round(min(last_ma5, last_close - 0.5 * last_atr), 2)
-    short_buy_high = round(last_close, 2)
-    short_target = round(last_close + 2.0 * last_atr, 2)
+    # 套用狀態聯動定價模型，消除價格與指引衝突
+    pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
     
-    mid_buy_low = round(min(last_ma20, last_ma60), 2)
-    mid_buy_high = round(max(last_ma20, last_close - 0.8 * last_atr), 2)
-    mid_target = round(last_close + 4.5 * last_atr, 2)
-    
-    # 建立 10 欄寬度的結構
+    # 建立與精選總覽一致的 10 欄寬表格
     table_df = pd.DataFrame([{
         "代號": sid,
         "名稱": row_match["stock_name"],
@@ -627,31 +637,19 @@ def get_single_stock_metrics(row_match, lookback_days):
         "最新收盤價": round(last_close, 2),
         f"近{lookback_days}日報酬(%)": ret_period,
         "月線順勢勝率(%)": win_rate,
-        "短期建議買入": f"{short_buy_low} ~ {short_buy_high}",
-        "短期目標賣出": short_target,
-        "中長建議買入": f"{mid_buy_low} ~ {mid_buy_high}",
-        "中長目標賣出": mid_target
+        "短期建議買入": pricing["short_buy_range"],
+        "短期目標賣出": pricing["short_target"],
+        "中長建議買入": pricing["mid_buy_range"],
+        "中長目標賣出": pricing["mid_target"]
     }])
 
-    if last_close >= last_ma20 and last_rsi >= 52:
-        summary_text = f"股價站穩月線之上呈多頭排列，RSI 強勢動能達 {last_rsi:.1f}，法人與主力買盤積極進駐，短線價量配合良好。"
-        prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，後續若回測五日線或月線支撐有守，可視為良性換手，建議採逢回分批買入策略。"
-    elif last_close < last_ma20 and last_rsi <= 45:
-        summary_text = f"近日賣壓沉重，外資與主力連續調節，股價跌破關鍵月線且 RSI 偏弱（{last_rsi:.1f}），短線進入弱勢修正。"
-        prediction_text = "**【宜觀望 / 等待止穩訊號】** 此股近日已跌深，但籌碼與族群表現疲弱，短線切勿急於接刀。建議保持觀望，等待量縮築底訊號浮現。"
-    else:
-        summary_text = f"已於月線附近區間震盪多日（RSI {last_rsi:.1f}），多空力量在此交戰拉鋸，成交量能溫和，靜待方向突破。"
-        prediction_text = "**【區間操作 / 保持彈性】** 此股目前處於箱型整理格局，方向尚未明朗。建議依循建議買入賣出價位進行區間來回操作，或靜待突破帶量再行追價。"
-
-    return table_df, summary_text, prediction_text
+    return table_df, pricing["summary_text"], pricing["prediction_text"]
 
 @st.dialog("📈 個股深度分析與行情預測", width="large")
-def show_single_stock_analysis_modal(full_universe_df, lookback_days, trading_date_str):
-    st.caption(f"📅 資料基準日：**`{trading_date_str}`** ｜ 請搜尋並選取您想評估的上市櫃個股")
-    
+def show_single_stock_analysis_modal(full_universe_df, lookback_days):
     stock_options = [f"{row['stock_id']} - {row['stock_name']} ({row['market']})" for _, row in full_universe_df.iterrows()]
     
-    # 修改 1：預設不選取任何股票，保持完全空白
+    # 預設不選取任何股票，保持完全空白搜尋框
     selected_str = st.selectbox(
         "🔍 搜尋股票代號或名稱",
         options=stock_options,
@@ -749,7 +747,7 @@ with st.sidebar:
         mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
         mtime_str = mtime.strftime("%Y-%m-%d %H:%M")
         cache_size = os.path.getsize(CACHE_PARQUET_FILE) / 1024.0
-        st.caption(f"• 本地快取：`{CACHE_PARQUET_FILE}`\n• 建立時間：`{mtime_str}`\n• 檔案大小：`{cache_size:.1f} KB`")
+        st.caption(f"• 本地快取：`{CACHE_PARQUET_FILE}`\n• 檔案大小：`{cache_size:.1f} KB`")
     else:
         st.caption("⚪ 快取尚未建立")
         
@@ -762,10 +760,10 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 執行全市場載入 (以台股官方真實日期為準)
+# 執行全市場載入
 with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
     force_run = st.session_state.force_refresh_cache
-    full_universe_df, data_trading_date = fetch_full_market_universe(force_refresh=force_run)
+    full_universe_df = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
         st.toast("✅ 已向官方重新同步最新盤後資料並寫入快取！")
@@ -779,19 +777,19 @@ with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
     stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
 
-# 頂部標題與按鈕區塊
+# 頂部標題與按鈕區塊 (取消顯示基準日)
 col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
 with col_h1:
     st.title("🎯 智慧選股系統")
-    st.markdown(f"📅 **資料基準日：`{data_trading_date}`** ｜ 點擊左上角 **☰** 調整選股條件。")
+    st.markdown("點擊左上角 **☰** 調整選股條件，一鍵取得精選 5 檔與買賣建議。")
 with col_h2:
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("📊 盤勢分析與預測", type="primary", use_container_width=True):
-        show_market_analysis_modal(data_trading_date)
+        show_market_analysis_modal()
 with col_h3:
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("⚠️ 免責聲明", use_container_width=True):
-        show_legal_disclaimer_modal(forced_consent=False)
+        show_legal_disclaimer_modal()
 
 # ==========================================
 # 醒目的個股分析按鈕 (亮藍色底色，介於盤勢分析與精選推薦之間)
@@ -800,7 +798,7 @@ st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
 with col_stock_btn_2:
     if st.button("📈 查詢與分析指定個股（個股分析）", key="btn_single_stock_analysis", use_container_width=True):
-        show_single_stock_analysis_modal(full_universe_df, lookback, data_trading_date)
+        show_single_stock_analysis_modal(full_universe_df, lookback)
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 
 batch_size = 5
@@ -824,7 +822,7 @@ with col_btn2:
         st.session_state.batch_page = 0
         st.rerun()
 
-# 置頂總覽表格 (10 欄寬結構)[cite: 1]
+# 置頂總覽表格 (10 欄寬結構)
 overview_merge = pd.merge(
     current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
     stock_bt_df[["代號", f"近{lookback}日報酬(%)", "月線順勢勝率(%)"]],
