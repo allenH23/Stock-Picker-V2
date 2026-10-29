@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import re
 import os
+import json
 
 # ==========================================
 # 頁面基本設定與手機版 UI 樣式優化
@@ -17,7 +18,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# 注入自訂 CSS：精準將個股分析按鈕強制鎖定為亮藍底色白字
+# 注入自訂 CSS：針對個股分析按鈕以高優先權 CSS Selector 鎖定亮藍底色與白字
 st.markdown("""
     <style>
     [data-testid="collapsedControl"] {
@@ -37,32 +38,40 @@ st.markdown("""
         margin-top: 25px;
         margin-bottom: 25px;
     }
-    /* 強制將個股分析按鈕鎖定為亮藍底色、白字 */
-    button[key="btn_single_stock_analysis"] {
+    /* 強制將個股分析專屬按鈕鎖定為亮藍底色與白字 (相容新舊版 Streamlit 渲染) */
+    div.stButton button[key="btn_single_stock_analysis"],
+    button[data-testid="baseButton-secondary"]:has(p:contains("個股分析")),
+    button:has(p:contains("個股分析")) {
         background-color: #1a73e8 !important;
+        background: #1a73e8 !important;
         border: 1px solid #1a73e8 !important;
-        box-shadow: 0 2px 6px rgba(26, 115, 232, 0.35) !important;
+        box-shadow: 0 3px 8px rgba(26, 115, 232, 0.4) !important;
         border-radius: 8px !important;
     }
-    button[key="btn_single_stock_analysis"] p {
+    div.stButton button[key="btn_single_stock_analysis"] p,
+    button:has(p:contains("個股分析")) p {
         color: #ffffff !important;
         font-weight: 700 !important;
         font-size: 1.05rem !important;
     }
-    button[key="btn_single_stock_analysis"]:hover {
+    div.stButton button[key="btn_single_stock_analysis"]:hover,
+    button:has(p:contains("個股分析")):hover {
         background-color: #1557b0 !important;
+        background: #1557b0 !important;
         border-color: #1557b0 !important;
     }
-    button[key="btn_single_stock_analysis"]:hover p {
+    div.stButton button[key="btn_single_stock_analysis"]:hover p,
+    button:has(p:contains("個股分析")):hover p {
         color: #ffffff !important;
     }
     </style>
 """, unsafe_allow_html=True)
 
 CACHE_PARQUET_FILE = "market_cache.parquet"
+META_JSON_FILE = "market_cache_meta.json"
 
 # ==========================================
-# 0. 法律免責聲明彈窗 (僅供手動查閱，取消首次強制彈出)
+# 0. 法律免責聲明彈窗 (僅供點擊查閱，取消首次強制阻擋)
 # ==========================================
 @st.dialog("⚖️ 投資風險與法律免責聲明", width="large")
 def show_legal_disclaimer_modal():
@@ -103,25 +112,42 @@ def refresh_market_themes():
     st.session_state.theme_dict = DEFAULT_THEME_DICT.copy()
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+def parse_tw_roc_date(roc_date_str: str) -> str:
+    weekday_map = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
+    try:
+        clean = re.sub(r"[^\d]", "", str(roc_date_str))
+        if len(clean) >= 7:
+            year = int(clean[:3]) + 1911
+            month = int(clean[3:5])
+            day = int(clean[5:7])
+            dt = datetime(year, month, day)
+            return f"{dt.strftime('%Y-%m-%d')} ({weekday_map.get(dt.weekday(), '')})"
+    except Exception:
+        pass
+    tw_now = datetime.utcnow() + timedelta(hours=8)
+    return f"{tw_now.strftime('%Y-%m-%d')} ({weekday_map.get(tw_now.weekday(), '')})"
+
 # ==========================================
 # 2. 全市場真實數據擷取與 Parquet 磁碟快取
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
-    # 1. 檢查本地快取是否存在且在 12 小時內
-    if not force_refresh and os.path.exists(CACHE_PARQUET_FILE):
+    if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
+            with open(META_JSON_FILE, "r", encoding="utf-8") as f:
+                meta_info = json.load(f)
+            cached_label = meta_info.get("tw_date_label", "")
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
-            if (datetime.now() - mtime).total_seconds() < 43200:
+            if (datetime.now() - mtime).total_seconds() < 43200 and cached_label:
                 df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
                 if not df_cached.empty and len(df_cached) >= 50:
                     df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
-                    return df_cached
+                    return df_cached, cached_label
         except Exception:
             pass
 
-    # 2. 連線官方 OpenAPI 抓取最新盤後資料
     headers = {"User-Agent": "Mozilla/5.0"}
     market_rows = []
+    twse_raw_date_str = ""
 
     pe_twse = {}
     try:
@@ -130,6 +156,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
             for row in r_pe.json():
                 code = str(row.get("Code", "")).strip()
                 if re.match(r"^[1-9]\d{3}$", code):
+                    if not twse_raw_date_str and "Date" in row:
+                        twse_raw_date_str = str(row["Date"])
                     pe_twse[code] = {
                         "name": row.get("Name", "").strip(),
                         "pe": pd.to_numeric(str(row.get("PEratio", "")).replace(",", ""), errors="coerce"),
@@ -144,6 +172,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
         if r_p.status_code == 200:
             for row in r_p.json():
                 code = str(row.get("Code", "")).strip()
+                if not twse_raw_date_str and "Date" in row:
+                    twse_raw_date_str = str(row["Date"])
                 if code in pe_twse:
                     vol_shares = pd.to_numeric(str(row.get("TradeVolume", "")).replace(",", ""), errors="coerce")
                     close_p = pd.to_numeric(str(row.get("ClosingPrice", "")).replace(",", ""), errors="coerce")
@@ -208,6 +238,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
         st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線或稍後再試。")
         st.stop()
 
+    actual_tw_label = parse_tw_roc_date(twse_raw_date_str)
+
     try:
         save_cols = [
             "stock_id", "stock_name", "market", "close", 
@@ -218,11 +250,13 @@ def fetch_full_market_universe(force_refresh: bool = False):
         if os.path.exists(CACHE_PARQUET_FILE):
             os.remove(CACHE_PARQUET_FILE)
         os.rename(temp_file, CACHE_PARQUET_FILE)
+        with open(META_JSON_FILE, "w", encoding="utf-8") as f:
+            json.dump({"tw_date_label": actual_tw_label}, f)
     except Exception:
         pass
 
     full_df["themes"] = full_df["stock_id"].apply(get_stock_themes)
-    return full_df
+    return full_df, actual_tw_label
 
 # ==========================================
 # 3. 第一階段漏斗初篩 (Top 25)
@@ -258,18 +292,13 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25)
     return ranked_pool
 
 # ==========================================
-# 4. 核心：狀態聯動動態定價與技術指標運算模型 (Regime-based Dynamic Pricing)
+# 4. 核心：狀態聯動動態定價與技術指標運算模型
 # ==========================================
 def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr):
-    """
-    根據個股多空趨勢狀態，精準計算買賣建議價位，消除『指引建議觀望，買入價卻包含現價』的邏輯衝突
-    """
-    # 狀態判斷
     is_bull = (last_close >= last_ma20) and (last_rsi >= 50)
     is_bear = (last_close < last_ma20) and (last_rsi < 45)
 
     if is_bull:
-        # 多頭強勢：拉回五日線支撐分批承接，不追在當日最高
         short_buy_low = round(min(last_ma5 - 0.2 * last_atr, last_close - 0.4 * last_atr), 2)
         short_buy_high = round(min(last_close, max(last_ma5, last_close - 0.1 * last_atr)), 2)
         if short_buy_low >= short_buy_high:
@@ -286,13 +315,13 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
 
         summary_text = f"股價站穩月線之上呈多頭排列，RSI 動能達 {last_rsi:.1f}，法人與主流買盤進駐，短線價量結構健康。"
         prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，建議待股價小幅回測五日線或月線支撐不破時，採逢回分批承接策略。"
+        score_penalty = 0.0
 
     elif is_bear:
-        # 空頭修正：絕不將現價列為買入區間，設定深幅折價支撐區，防止接刀
         short_buy_low = round(last_close - 1.8 * last_atr, 2)
         short_buy_high = round(last_close - 1.0 * last_atr, 2)
         short_buy_range = f"{short_buy_low} ~ {short_buy_high} (測撐區)"
-        short_target = round(last_close + 1.2 * last_atr, 2) # 反彈即停利
+        short_target = round(last_close + 1.2 * last_atr, 2)
         short_stop = round(last_close - 2.0 * last_atr, 2)
 
         mid_buy_low = round(min(last_ma60 * 0.95, last_close - 2.5 * last_atr), 2)
@@ -303,9 +332,10 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
 
         summary_text = f"近日賣壓沉重，外資與主力連續調節，股價跌破關鍵月線且 RSI 偏弱（{last_rsi:.1f}），短線進入弱勢修正。"
         prediction_text = "**【宜觀望 / 勿急於接刀】** 此股近日面臨修正壓力，現價風險較高。建議保持觀望，耐心等待股價回落至下方預估測撐區並出現止穩訊號再行評估。"
+        # 空頭破線股票在精選推薦中扣分，避免前5名出現一邊推薦一邊叫人觀望的矛盾
+        score_penalty = -50.0
 
     else:
-        # 箱型整理：限制在箱型下半部承接，不在中軸或頂部追價
         short_buy_low = round(last_ma20 - 1.0 * last_atr, 2)
         short_buy_high = round(last_ma20 - 0.3 * last_atr, 2)
         short_buy_range = f"{short_buy_low} ~ {short_buy_high}"
@@ -320,6 +350,7 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
 
         summary_text = f"已於月線附近區間震盪多日（RSI {last_rsi:.1f}），多空力量在此交戰拉鋸，成交量能溫和，靜待方向突破。"
         prediction_text = "**【區間操作 / 保持彈性】** 此股目前處於箱型整理格局，方向尚未明朗。切勿追高現價，建議在建議買入區間（箱型下緣）低接、接近目標價時獲利調節。"
+        score_penalty = -10.0
 
     return {
         "short_buy_range": short_buy_range,
@@ -329,7 +360,8 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         "mid_target": mid_target,
         "mid_stop": mid_stop,
         "summary_text": summary_text,
-        "prediction_text": prediction_text
+        "prediction_text": prediction_text,
+        "score_penalty": score_penalty
     }
 
 # ==========================================
@@ -399,7 +431,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
         vol_ratio = float(v.iloc[-1] / max(v.iloc[-6:-1].mean(), 1))
         ret_5d = float((c.iloc[-1] / c.iloc[-6] - 1) * 100) if len(c) >= 6 else 0.0
         
-        # 套用狀態聯動定價模型
         pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
         
         hist_df["MA20"] = ma20
@@ -426,7 +457,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
             "mid_target": pricing["mid_target"],
             "mid_stop": pricing["mid_stop"],
             "recommend_reason": reason,
-            "final_score": row["stage1_score"] + (last_rsi * 0.3) + (15.0 if last_close >= last_ma20 else 0.0)
+            "final_score": row["stage1_score"] + (last_rsi * 0.3) + (15.0 if last_close >= last_ma20 else 0.0) + pricing["score_penalty"]
         })
 
     final_df = pd.DataFrame(enriched_rows).sort_values(by="final_score", ascending=False).reset_index(drop=True)
@@ -485,7 +516,7 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 7. 即時國際指數抓取與大盤預測模組
+# 7. 即時國際指數抓取與大盤預測模組 (記錄各市場最新日期)
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_live_market_data():
@@ -507,7 +538,9 @@ def get_live_market_data():
                     curr = float(closes.iloc[-1])
                     prev = float(closes.iloc[-2])
                     pct = (curr / prev - 1) * 100
-                    data[chinese_name] = {"close": round(curr, 2), "pct": round(pct, 2)}
+                    # 擷取該指數實際收盤交易日期
+                    dt_str = closes.index[-1].strftime("%Y-%m-%d")
+                    data[chinese_name] = {"close": round(curr, 2), "pct": round(pct, 2), "date": dt_str}
         except Exception:
             pass
     return data
@@ -534,7 +567,7 @@ def generate_dynamic_analysis_texts(market_data: dict):
     return today_summary, tomorrow_pred
 
 # ==========================================
-# 8. 盤勢分析與預測彈跳視窗 (已取消顯示日期)
+# 8. 盤勢分析與預測彈跳視窗 (最下端個別標記台股及美股檔案與日期)
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
 def show_market_analysis_modal():
@@ -555,6 +588,16 @@ def show_market_analysis_modal():
         for i, (chinese_name, v) in enumerate(market_data.items()):
             cols[i].metric(chinese_name, f"{v['close']:,}", f"{v['pct']:+.2f}%")
             
+    # 需求1：於彈窗最下端個別顯示台股及美股檔案與實際交易日
+    st.markdown("---")
+    tw_date = market_data.get("台灣加權指數", {}).get("date", "最新交易日")
+    us_date = market_data.get("費城半導體指數", {}).get("date", "最新交易日")
+    st.caption(
+        f"🕒 **市場數據來源與結算日期標記**：\n"
+        f"• **台股行情來源**：`TWSE/TPEx OpenAPI` & `^TWII` ｜ 結算日期：`{tw_date}` 盤後\n"
+        f"• **美股指數來源**：`Yahoo Finance (^SOX, ^IXIC, ^DJI)` ｜ 結算日期：`{us_date}` 昨收"
+    )
+    
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("關閉視窗", use_container_width=True):
         st.rerun()
@@ -626,10 +669,8 @@ def get_single_stock_metrics(row_match, lookback_days):
     active_days = hist_df[hist_df["signal"] == 1]
     win_rate = round((active_days["strat_ret"] > 0).mean() * 100, 1) if len(active_days) > 0 else 50.0
     
-    # 套用狀態聯動定價模型，消除價格與指引衝突
     pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
     
-    # 建立與精選總覽一致的 10 欄寬表格
     table_df = pd.DataFrame([{
         "代號": sid,
         "名稱": row_match["stock_name"],
@@ -649,7 +690,6 @@ def get_single_stock_metrics(row_match, lookback_days):
 def show_single_stock_analysis_modal(full_universe_df, lookback_days):
     stock_options = [f"{row['stock_id']} - {row['stock_name']} ({row['market']})" for _, row in full_universe_df.iterrows()]
     
-    # 預設不選取任何股票，保持完全空白搜尋框
     selected_str = st.selectbox(
         "🔍 搜尋股票代號或名稱",
         options=stock_options,
@@ -743,11 +783,26 @@ with st.sidebar:
     
     st.divider()
     st.subheader("💾 盤後資料狀態")
+    # 需求1：在側邊欄盤後資料狀態增加顯示資料日期
     if os.path.exists(CACHE_PARQUET_FILE):
         mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
         mtime_str = mtime.strftime("%Y-%m-%d %H:%M")
         cache_size = os.path.getsize(CACHE_PARQUET_FILE) / 1024.0
-        st.caption(f"• 本地快取：`{CACHE_PARQUET_FILE}`\n• 檔案大小：`{cache_size:.1f} KB`")
+        
+        tw_data_date = "同步中"
+        if os.path.exists(META_JSON_FILE):
+            try:
+                with open(META_JSON_FILE, "r", encoding="utf-8") as f:
+                    tw_data_date = json.load(f).get("tw_date_label", mtime.strftime("%Y-%m-%d"))
+            except Exception:
+                tw_data_date = mtime.strftime("%Y-%m-%d")
+
+        st.caption(
+            f"• **快取檔案**：`{CACHE_PARQUET_FILE}`\n"
+            f"• **資料基準日**：`{tw_data_date}`\n"
+            f"• **檔案更新時間**：`{mtime_str}`\n"
+            f"• **檔案大小**：`{cache_size:.1f} KB`"
+        )
     else:
         st.caption("⚪ 快取尚未建立")
         
@@ -760,10 +815,9 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 執行全市場載入
 with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
     force_run = st.session_state.force_refresh_cache
-    full_universe_df = fetch_full_market_universe(force_refresh=force_run)
+    full_universe_df, tw_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
         st.toast("✅ 已向官方重新同步最新盤後資料並寫入快取！")
@@ -777,7 +831,7 @@ with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
     stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
 
-# 頂部標題與按鈕區塊 (取消顯示基準日)
+# 頂部標題與按鈕區塊
 col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
 with col_h1:
     st.title("🎯 智慧選股系統")
@@ -792,7 +846,7 @@ with col_h3:
         show_legal_disclaimer_modal()
 
 # ==========================================
-# 醒目的個股分析按鈕 (亮藍色底色，介於盤勢分析與精選推薦之間)
+# 醒目的個股分析按鈕 (已修正保證為藍底白字，位於盤勢分析與精選推薦之間)
 # ==========================================
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
