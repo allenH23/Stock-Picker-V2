@@ -38,7 +38,6 @@ st.markdown("""
         margin-top: 25px;
         margin-bottom: 25px;
     }
-    /* 透過 Streamlit 原生 key class 與標準 aria-label 選擇器雙重鎖定亮藍底色 */
     div.st-key-btn_single_stock_analysis button,
     button[aria-label*="個股分析"] {
         background-color: #1a73e8 !important;
@@ -75,7 +74,7 @@ CACHE_PARQUET_FILE = "market_cache.parquet"
 META_JSON_FILE = "market_cache_meta.json"
 
 # ==========================================
-# 0. 法律免責聲明彈窗 (取消強制阻擋，僅備查)
+# 0. 法律免責聲明彈窗 (僅備查，不強制彈出)
 # ==========================================
 @st.dialog("⚖️ 投資風險與法律免責聲明", width="large")
 def show_legal_disclaimer_modal():
@@ -263,40 +262,66 @@ def fetch_full_market_universe(force_refresh: bool = False):
     return full_df, actual_tw_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩 (Top 25)
+# 3. 第一階段漏斗初篩 (升級：各等級互斥與特化權重，大幅降低重疊率)
 # ==========================================
-def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
+def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35) -> pd.DataFrame:
     df = full_df.copy()
     df["stage1_score"] = 0.0
 
+    # -------------------------------------------------------------
+    # 1. 基本面特化分流 (避免績優股通吃三個等級)
+    # -------------------------------------------------------------
     if selections["fundamental"]["enabled"]:
         lvl = selections["fundamental"]["level"]
         if lvl == "嚴格績優":
+            # 追求極致高股息與低本益比 (價值防禦)
             cond = (df["pe_ratio"] <= 18) & (df["dividend_yield"] >= 3.8)
+            score = cond.astype(int) * 35.0 + (df["dividend_yield"] * 3.0) - (df["pe_ratio"] * 0.4)
         elif lvl == "穩健成長":
-            cond = (df["pe_ratio"] <= 26) & (df["dividend_yield"] >= 2.2)
-        else:
-            cond = (df["pe_ratio"] <= 38) & (df["pb_ratio"] <= 6.0)
-        df["stage1_score"] += cond.astype(int) * 35.0 + (df["dividend_yield"] * 2.5) - (df["pe_ratio"] * 0.2)
+            # 鎖定中本益比成長股 (15 <= PE <= 26)，對過低PE牛皮股或過高PE泡沫股減分
+            cond = (df["pe_ratio"] >= 14) & (df["pe_ratio"] <= 27) & (df["dividend_yield"] >= 1.8)
+            pe_dist = (df["pe_ratio"] - 20.0).abs() # 20 倍為成長股黃金基準
+            score = cond.astype(int) * 35.0 + 15.0 - (pe_dist * 1.2) + (df["dividend_yield"] * 1.5)
+        else: # 價值轉機
+            # 鎖定極低 PB 折價股 (PB <= 1.8)，高 PB 成長股直接倒扣 30 分！
+            cond = (df["pb_ratio"] <= 1.9) & (df["pe_ratio"] <= 38)
+            score = cond.astype(int) * 40.0 + (2.0 - df["pb_ratio"]).clip(lower=-1.0) * 20.0
+            score -= (df["pb_ratio"] > 3.0).astype(int) * 35.0 # 高 PB 股重罰
+        df["stage1_score"] += score
 
+    # -------------------------------------------------------------
+    # 2. 市場／籌碼面特化分流 (避免萬張權值股通吃)
+    # -------------------------------------------------------------
     if selections["market"]["enabled"]:
         lvl = selections["market"]["level"]
-        vol_req = 3000 if lvl == "法人重倉連買" else (1500 if lvl == "法人溫和布局" else 600)
-        cond = df["volume_sheets"] >= vol_req
-        df["stage1_score"] += cond.astype(int) * 30.0 + np.log1p(df["volume_sheets"]) * 3.0
+        if lvl == "法人重倉連買":
+            # 鎖定大成交量權值龍頭股 (量 >= 3,500 張)
+            cond = df["volume_sheets"] >= 3500
+            score = cond.astype(int) * 30.0 + np.log1p(df["volume_sheets"]) * 3.5
+        elif lvl == "法人溫和布局":
+            # 鎖定中型成長股 (1,200 ~ 5,500 張)，萬張巨量股不加額外高分
+            cond = (df["volume_sheets"] >= 1200) & (df["volume_sheets"] <= 5500)
+            score = cond.astype(int) * 35.0 + 10.0 - ((df["volume_sheets"] - 2800).abs() / 500.0)
+        else: # 低檔承接
+            # 鎖定成交量溫和、量縮沉澱股 (300 ~ 1,800 張)；大於 3,000 張直接倒扣 35 分！
+            cond = (df["volume_sheets"] >= 300) & (df["volume_sheets"] <= 1800)
+            score = cond.astype(int) * 40.0 - (df["volume_sheets"] > 3000).astype(int) * 35.0
+        df["stage1_score"] += score
 
+    # -------------------------------------------------------------
+    # 3. 熱門題材加權
+    # -------------------------------------------------------------
     if selections["theme"]["enabled"]:
         lvl = selections["theme"]["level"]
         target = lvl
         cond = df["themes"].apply(lambda t_list: any(target in t for t in t_list))
-        df["stage1_score"] += cond.astype(int) * 50.0
+        df["stage1_score"] += cond.astype(int) * 45.0
 
-    df["stage1_score"] += np.log1p(df["volume_sheets"]) * 1.5
     ranked_pool = df.sort_values(by="stage1_score", ascending=False).head(top_n).reset_index(drop=True)
     return ranked_pool
 
 # ==========================================
-# 4. 狀態聯動動態定價模型 (不否決個股，客觀計算買賣價與指引)
+# 4. 狀態聯動動態定價模型
 # ==========================================
 def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr):
     is_bull = (last_close >= last_ma20) and (last_rsi >= 50)
@@ -321,7 +346,6 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，建議待股價小幅回測五日線或月線支撐不破時，採逢回分批承接策略。"
 
     elif is_bear:
-        # 空頭修正狀態：買入價位標示為下方測撐區，不將現價列為買入上緣
         short_buy_low = round(last_close - 1.8 * last_atr, 2)
         short_buy_high = round(last_close - 1.0 * last_atr, 2)
         short_buy_range = f"{short_buy_low} ~ {short_buy_high} (測撐區)"
@@ -365,9 +389,9 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
     }
 
 # ==========================================
-# 5. 第二階段：精準技術指標與回測歷史運算 (保留所有合格股)
+# 5. 第二階段：精準技術指標與等級特色連動運算
 # ==========================================
-def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
+def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     history_dict = {}
     enriched_rows = []
     
@@ -437,6 +461,32 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
+        # -------------------------------------------------------------
+        # 技術面特化加權 (使「強勢突破」與「底部反彈」選出截然不同的股票)
+        # -------------------------------------------------------------
+        tech_score = 0.0
+        if selections["technical"]["enabled"]:
+            lvl_t = selections["technical"]["level"]
+            if lvl_t == "強勢突破":
+                # 強勢多頭排列且動能強 (RSI >= 54)
+                if last_close >= last_ma5 and last_ma5 >= last_ma20 and last_rsi >= 54:
+                    tech_score = 35.0 + (last_rsi * 0.3) + min(vol_ratio * 4.0, 15.0)
+                else:
+                    tech_score = (last_rsi * 0.1)
+            elif lvl_t == "多頭排列":
+                # 穩健多頭排列 (站穩月線、RSI 溫和在 48~65)
+                if last_close >= last_ma20 and last_ma20 >= last_ma60:
+                    tech_score = 30.0 + (15.0 - (last_rsi - 55.0).abs())
+            else: # 底部支撐反彈
+                # 股價靠近季線支撐或 RSI <= 45，高檔股重罰！
+                dist_to_ma60 = ((last_close - last_ma60) / last_ma60).abs()
+                if dist_to_ma60 <= 0.05 or last_rsi <= 45:
+                    tech_score = 40.0 + (50.0 - last_rsi).clip(lower=0) * 0.8
+                else:
+                    tech_score = -20.0 # 高檔追高股直接倒扣分
+        else:
+            tech_score = (last_rsi * 0.2) + (10.0 if last_close >= last_ma20 else 0.0)
+
         trend_desc = "呈多頭排列" if last_close >= last_ma20 else "回測均線支撐"
         reason = f"本益比 {row['pe_ratio']:.1f} 倍、殖利率 {row['dividend_yield']:.1f}%，股價站穩關鍵均線{trend_desc}（RSI {last_rsi:.1f}，成交量 {int(row['volume_sheets']):,} 張）。"
         
@@ -457,7 +507,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame):
             "mid_target": pricing["mid_target"],
             "mid_stop": pricing["mid_stop"],
             "recommend_reason": reason,
-            "final_score": row["stage1_score"] + (last_rsi * 0.3) + (15.0 if last_close >= last_ma20 else 0.0)
+            "final_score": row["stage1_score"] + tech_score
         })
 
     final_df = pd.DataFrame(enriched_rows).sort_values(by="final_score", ascending=False).reset_index(drop=True)
@@ -566,7 +616,7 @@ def generate_dynamic_analysis_texts(market_data: dict):
     return today_summary, tomorrow_pred
 
 # ==========================================
-# 8. 盤勢分析與預測彈跳視窗 (顯示各市場檔案與結算日期)
+# 8. 盤勢分析與預測彈跳視窗
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
 def show_market_analysis_modal():
@@ -825,8 +875,8 @@ with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
         "market": {"enabled": use_mkt, "level": lvl_mkt},
         "theme": {"enabled": use_theme, "level": lvl_theme},
     }
-    stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
-    ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates)
+    stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=35)
+    ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates, selections)
 
 # 頂部標題與按鈕區塊
 col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
@@ -843,7 +893,7 @@ with col_h3:
         show_legal_disclaimer_modal()
 
 # ==========================================
-# 醒目的個股分析按鈕 (藍底白字，介於盤勢分析與精選推薦之間)
+# 醒目的個股分析按鈕 (藍底白字)
 # ==========================================
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
