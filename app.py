@@ -262,55 +262,43 @@ def fetch_full_market_universe(force_refresh: bool = False):
     return full_df, actual_tw_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩 (升級：各等級互斥與特化權重，大幅降低重疊率)
+# 3. 第一階段漏斗初篩
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35) -> pd.DataFrame:
     df = full_df.copy()
     df["stage1_score"] = 0.0
 
-    # -------------------------------------------------------------
-    # 1. 基本面特化分流 (避免績優股通吃三個等級)
-    # -------------------------------------------------------------
+    # 1. 基本面特化分流
     if selections["fundamental"]["enabled"]:
         lvl = selections["fundamental"]["level"]
         if lvl == "嚴格績優":
-            # 追求極致高股息與低本益比 (價值防禦)
             cond = (df["pe_ratio"] <= 18) & (df["dividend_yield"] >= 3.8)
             score = cond.astype(int) * 35.0 + (df["dividend_yield"] * 3.0) - (df["pe_ratio"] * 0.4)
         elif lvl == "穩健成長":
-            # 鎖定中本益比成長股 (15 <= PE <= 26)，對過低PE牛皮股或過高PE泡沫股減分
             cond = (df["pe_ratio"] >= 14) & (df["pe_ratio"] <= 27) & (df["dividend_yield"] >= 1.8)
-            pe_dist = (df["pe_ratio"] - 20.0).abs() # 20 倍為成長股黃金基準
+            pe_dist = (df["pe_ratio"] - 20.0).abs()
             score = cond.astype(int) * 35.0 + 15.0 - (pe_dist * 1.2) + (df["dividend_yield"] * 1.5)
-        else: # 價值轉機
-            # 鎖定極低 PB 折價股 (PB <= 1.8)，高 PB 成長股直接倒扣 30 分！
+        else:  # 價值轉機
             cond = (df["pb_ratio"] <= 1.9) & (df["pe_ratio"] <= 38)
             score = cond.astype(int) * 40.0 + (2.0 - df["pb_ratio"]).clip(lower=-1.0) * 20.0
-            score -= (df["pb_ratio"] > 3.0).astype(int) * 35.0 # 高 PB 股重罰
+            score -= (df["pb_ratio"] > 3.0).astype(int) * 35.0
         df["stage1_score"] += score
 
-    # -------------------------------------------------------------
-    # 2. 市場／籌碼面特化分流 (避免萬張權值股通吃)
-    # -------------------------------------------------------------
+    # 2. 市場／籌碼面特化分流
     if selections["market"]["enabled"]:
         lvl = selections["market"]["level"]
         if lvl == "法人重倉連買":
-            # 鎖定大成交量權值龍頭股 (量 >= 3,500 張)
             cond = df["volume_sheets"] >= 3500
             score = cond.astype(int) * 30.0 + np.log1p(df["volume_sheets"]) * 3.5
         elif lvl == "法人溫和布局":
-            # 鎖定中型成長股 (1,200 ~ 5,500 張)，萬張巨量股不加額外高分
             cond = (df["volume_sheets"] >= 1200) & (df["volume_sheets"] <= 5500)
             score = cond.astype(int) * 35.0 + 10.0 - ((df["volume_sheets"] - 2800).abs() / 500.0)
-        else: # 低檔承接
-            # 鎖定成交量溫和、量縮沉澱股 (300 ~ 1,800 張)；大於 3,000 張直接倒扣 35 分！
+        else:  # 低檔承接
             cond = (df["volume_sheets"] >= 300) & (df["volume_sheets"] <= 1800)
             score = cond.astype(int) * 40.0 - (df["volume_sheets"] > 3000).astype(int) * 35.0
         df["stage1_score"] += score
 
-    # -------------------------------------------------------------
     # 3. 熱門題材加權
-    # -------------------------------------------------------------
     if selections["theme"]["enabled"]:
         lvl = selections["theme"]["level"]
         target = lvl
@@ -389,7 +377,7 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
     }
 
 # ==========================================
-# 5. 第二階段：精準技術指標與等級特色連動運算
+# 5. 第二階段：精準技術指標與回測歷史運算 (已修復 float .abs() 與 .clip() 錯誤)
 # ==========================================
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     history_dict = {}
@@ -461,29 +449,24 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
-        # -------------------------------------------------------------
-        # 技術面特化加權 (使「強勢突破」與「底部反彈」選出截然不同的股票)
-        # -------------------------------------------------------------
+        # 技術面特化加權 (使用標準 Python 數值運算修復 AttributeError)
         tech_score = 0.0
         if selections["technical"]["enabled"]:
             lvl_t = selections["technical"]["level"]
             if lvl_t == "強勢突破":
-                # 強勢多頭排列且動能強 (RSI >= 54)
                 if last_close >= last_ma5 and last_ma5 >= last_ma20 and last_rsi >= 54:
                     tech_score = 35.0 + (last_rsi * 0.3) + min(vol_ratio * 4.0, 15.0)
                 else:
                     tech_score = (last_rsi * 0.1)
             elif lvl_t == "多頭排列":
-                # 穩健多頭排列 (站穩月線、RSI 溫和在 48~65)
                 if last_close >= last_ma20 and last_ma20 >= last_ma60:
-                    tech_score = 30.0 + (15.0 - (last_rsi - 55.0).abs())
-            else: # 底部支撐反彈
-                # 股價靠近季線支撐或 RSI <= 45，高檔股重罰！
-                dist_to_ma60 = ((last_close - last_ma60) / last_ma60).abs()
+                    tech_score = 30.0 + (15.0 - abs(last_rsi - 55.0))
+            else:  # 底部支撐反彈 (已修復 .abs() 與 .clip())
+                dist_to_ma60 = abs((last_close - last_ma60) / last_ma60) if last_ma60 > 0 else 0.0
                 if dist_to_ma60 <= 0.05 or last_rsi <= 45:
-                    tech_score = 40.0 + (50.0 - last_rsi).clip(lower=0) * 0.8
+                    tech_score = 40.0 + max(50.0 - last_rsi, 0.0) * 0.8
                 else:
-                    tech_score = -20.0 # 高檔追高股直接倒扣分
+                    tech_score = -20.0
         else:
             tech_score = (last_rsi * 0.2) + (10.0 if last_close >= last_ma20 else 0.0)
 
@@ -651,7 +634,7 @@ def show_market_analysis_modal():
         st.rerun()
 
 # ==========================================
-# 9. 個股深度分析彈跳視窗 (預設空白搜尋框 + 狀態聯動定價)
+# 9. 個股深度分析彈跳視窗
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
     sid = row_match["stock_id"]
@@ -923,7 +906,7 @@ with col_btn2:
         st.session_state.batch_page = 0
         st.rerun()
 
-# 置頂總覽表格 (10 欄寬結構)
+# 置頂總覽表格
 overview_merge = pd.merge(
     current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
     stock_bt_df[["代號", f"近{lookback}日報酬(%)", "月線順勢勝率(%)"]],
