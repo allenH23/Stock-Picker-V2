@@ -18,7 +18,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# 注入自訂 CSS：精確鎖定個股分析按鈕為亮藍底色與白字
 st.markdown("""
     <style>
     [data-testid="collapsedControl"] {
@@ -270,9 +269,9 @@ def fetch_full_market_universe(force_refresh: bool = False):
     return full_df, actual_tw_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩
+# 3. 第一階段漏斗初篩 (精確收斂為 25 檔候選股)
 # ==========================================
-def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35) -> pd.DataFrame:
+def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
     df = full_df[~full_df["stock_id"].str.startswith("00") & (full_df["volume_sheets"] >= 80)].copy()
     if df.empty:
         df = full_df.copy()
@@ -388,7 +387,6 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
 # ==========================================
 @st.cache_data(ttl=14400, show_spinner=False)
 def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
-    """針對單一股票代號抓取近 1 年日 K 線，並由 Streamlit 記憶體自動快取。"""
     sid = str(sid).strip()
     market_str = str(market_str).strip()
     ticker = f"{sid}.TW" if "上市" in market_str else f"{sid}.TWO"
@@ -410,7 +408,7 @@ def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
     return hist_df
 
 # ==========================================
-# 6. 第二階段：精準技術指標與回測歷史運算 (整合記憶體快取)
+# 6. 第二階段：自適應動態共振加權與技術指標運算
 # ==========================================
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     history_dict = {}
@@ -419,10 +417,21 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     dates = pd.bdate_range(end=datetime.today(), periods=250)
     np.random.seed(42)
 
+    # 1. 識別使用者目前實際啟用的面向清單 (動態分母)
+    active_factors = []
+    if selections["fundamental"]["enabled"]:
+        active_factors.append("fund")
+    if selections["technical"]["enabled"]:
+        active_factors.append("tech")
+    if selections["market"]["enabled"]:
+        active_factors.append("mkt")
+    if selections["theme"]["enabled"]:
+        active_factors.append("theme")
+        
+    total_active = len(active_factors)
+
     for idx, row in candidate_df.iterrows():
         sid = str(row["stock_id"])
-        
-        # 🟢 調用記憶體快取，切換批次與調整天數時秒讀傳回
         hist_df = get_cached_stock_kline(sid, row["market"])
             
         if hist_df.empty:
@@ -463,9 +472,12 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         last_ma5 = float(ma5.iloc[-1])
         last_ma20 = float(ma20.iloc[-1])
         last_ma60 = float(ma60.iloc[-1])
+        prev_ma60 = float(ma60.iloc[-6]) if len(ma60) >= 6 else last_ma60
         last_rsi = float(rsi14.iloc[-1])
         last_atr = float(atr14.iloc[-1])
-        vol_ratio = float(v.iloc[-1] / max(v.iloc[-6:-1].mean(), 1))
+        
+        avg_v_5d = max(float(v.iloc[-6:-1].mean()), 1.0)
+        vol_ratio = float(v.iloc[-1] / avg_v_5d)
         ret_5d = float((c.iloc[-1] / c.iloc[-6] - 1) * 100) if len(c) >= 6 else 0.0
         
         pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
@@ -474,25 +486,93 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
+        # ------------------------------------------
+        # 2. 技術面特化加權 (含非線性指數型加分)
+        # ------------------------------------------
         tech_score = 0.0
+        tech_hit = False
         if selections["technical"]["enabled"]:
             lvl_t = selections["technical"]["level"]
             if lvl_t == "強勢突破":
                 if last_close >= last_ma5 and last_ma5 >= last_ma20 and last_rsi >= 54:
-                    tech_score = 35.0 + (last_rsi * 0.3) + min(vol_ratio * 4.0, 15.0)
+                    vol_bonus = 25.0 + (vol_ratio - 2.0) * 8.0 if vol_ratio >= 2.0 else (15.0 if vol_ratio >= 1.3 else 5.0)
+                    tech_score = 35.0 + (last_rsi * 0.3) + vol_bonus
+                    tech_hit = True
                 else:
                     tech_score = (last_rsi * 0.1)
             elif lvl_t == "多頭排列":
                 if last_close >= last_ma20 and last_ma20 >= last_ma60:
-                    tech_score = 30.0 + (15.0 - abs(last_rsi - 55.0))
+                    golden_fan = 20.0 if (last_ma5 > last_ma20 > last_ma60) else 0.0
+                    tech_score = 30.0 + (15.0 - abs(last_rsi - 55.0)) + golden_fan
+                    tech_hit = True
             else:  # 底部支撐反彈
                 dist_to_ma60 = abs((last_close - last_ma60) / last_ma60) if last_ma60 > 0 else 0.0
                 if dist_to_ma60 <= 0.05 or last_rsi <= 45:
                     tech_score = 40.0 + max(50.0 - last_rsi, 0.0) * 0.8
+                    tech_hit = True
                 else:
                     tech_score = -20.0
         else:
             tech_score = (last_rsi * 0.2) + (10.0 if last_close >= last_ma20 else 0.0)
+
+        base_combined_score = row["stage1_score"] + tech_score
+
+        # ------------------------------------------
+        # 3. 自適應動態共振判定 (只看實際啟用的面向)
+        # ------------------------------------------
+        hit_count = 0
+        if "fund" in active_factors:
+            # 基本面達標：依據第一階段評分門檻判定
+            hit_count += int(row["stage1_score"] >= 25.0)
+
+        if "tech" in active_factors:
+            # 技術面達標：完全符合該等級之主訊號或站穩月線
+            hit_count += int(tech_hit or (last_close >= last_ma20 and last_rsi >= 50.0))
+
+        if "mkt" in active_factors:
+            # 籌碼面達標：量比顯著放大或絕對成交張數充足
+            hit_count += int(vol_ratio >= 1.25 or row["volume_sheets"] >= 2000.0)
+
+        if "theme" in active_factors:
+            # 題材面達標：股票題材清單精確命中選取之主題
+            stock_themes = get_stock_themes(sid)
+            hit_count += int(any(selections["theme"]["level"] in t for t in stock_themes))
+
+        # 計算動態乘數
+        if total_active > 0:
+            hit_ratio = hit_count / float(total_active)
+            if hit_ratio == 1.0:
+                multiplier = 1.35  # 所有勾選條件 100% 完美共振
+            elif hit_ratio >= 0.5:
+                multiplier = 1.15  # 過半條件達標
+            else:
+                multiplier = 1.0   # 未達半數
+        else:
+            multiplier = 1.0
+
+        scaled_score = base_combined_score * multiplier
+
+        # ------------------------------------------
+        # 4. 破壞性扣分項 (不論勾選面向為何，均過濾高風險結構)
+        # ------------------------------------------
+        penalties = 0.0
+        
+        # (1) 高檔正乖離過大（防止追高被套）
+        bias_ma20 = (last_close - last_ma20) / last_ma20 if last_ma20 > 0 else 0.0
+        if bias_ma20 > 0.15:
+            penalties += 25.0
+            
+        # (2) 量價背離（創近 10 日新高但量能急縮逾 30%）
+        highest_10d = float(c.iloc[-10:].max()) if len(c) >= 10 else last_close
+        if last_close >= highest_10d * 0.99 and vol_ratio < 0.70:
+            penalties += 20.0
+
+        # (3) 季線下彎蓋頭且股價在季線之下
+        ma60_slope_down = (last_ma60 < prev_ma60)
+        if ma60_slope_down and last_close < last_ma60:
+            penalties += 25.0
+
+        final_calc_score = round(max(scaled_score - penalties, 10.0), 1)
 
         trend_desc = "呈多頭排列" if last_close >= last_ma20 else "回測均線支撐"
         pe_str = f"本益比 {row['pe_ratio']:.1f} 倍、" if pd.notnull(row['pe_ratio']) else ""
@@ -516,7 +596,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
             "mid_target": pricing["mid_target"],
             "mid_stop": pricing["mid_stop"],
             "recommend_reason": reason,
-            "final_score": row["stage1_score"] + tech_score
+            "final_score": final_calc_score
         })
 
     final_df = pd.DataFrame(enriched_rows).sort_values(by="final_score", ascending=False).reset_index(drop=True)
@@ -660,14 +740,13 @@ def show_market_analysis_modal():
         st.rerun()
 
 # ==========================================
-# 10. 個股深度分析彈跳視窗 (整合快取)
+# 10. 個股深度分析彈跳視窗
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
     sid = str(row_match["stock_id"])
     market = str(row_match["market"])
     base_close = float(row_match.get("close", 100.0))
     
-    # 🟢 調用記憶體快取
     hist_df = get_cached_stock_kline(sid, market)
         
     if hist_df.empty:
@@ -886,7 +965,7 @@ with st.sidebar:
         
     if st.button("🔄 強制重新抓取並更新快取", use_container_width=True):
         st.session_state.force_refresh_cache = True
-        st.cache_data.clear()  # 🟢 同步清空記憶體二級快取
+        st.cache_data.clear()
         st.rerun()
 
 current_config_key = f"{use_fund}_{lvl_fund}_{use_tech}_{lvl_tech}_{use_mkt}_{lvl_mkt}_{use_theme}_{lvl_theme}_{st.session_state.theme_last_update}"
@@ -894,7 +973,6 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-# 🟢 優化後更精準的 Spinner 載入提示語
 with st.spinner("🚀 正在讀取全市場資料並計算候選標的技術指標..."):
     force_run = st.session_state.force_refresh_cache
     full_universe_df, tw_trading_date = fetch_full_market_universe(force_refresh=force_run)
@@ -908,7 +986,7 @@ with st.spinner("🚀 正在讀取全市場資料並計算候選標的技術指�
         "market": {"enabled": use_mkt, "level": lvl_mkt},
         "theme": {"enabled": use_theme, "level": lvl_theme},
     }
-    stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=35)
+    stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
     ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates, selections)
 
 # 頂部標題與按鈕區塊
@@ -925,9 +1003,7 @@ with col_h3:
     if st.button("⚠️ 免責聲明", use_container_width=True):
         show_legal_disclaimer_modal()
 
-# ==========================================
-# 醒目的個股分析按鈕 (藍底白字)
-# ==========================================
+# 個股分析按鈕
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
 with col_stock_btn_2:
