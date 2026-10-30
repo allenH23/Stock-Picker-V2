@@ -131,9 +131,10 @@ def parse_tw_roc_date(roc_date_str: str) -> str:
     return f"{tw_now.strftime('%Y-%m-%d')} ({weekday_map.get(tw_now.weekday(), '')})"
 
 # ==========================================
-# 2. 全市場真實數據擷取與 Parquet 磁碟快取
+# 2. 全市場真實數據擷取與 Parquet 磁碟快取 (含全股票與全ETF支援)
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
+    # 快取驗證：除了時間外，必須包含 ETF (00開頭) 資料，否則判定為舊版快取並自動重新同步
     if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
             with open(META_JSON_FILE, "r", encoding="utf-8") as f:
@@ -142,7 +143,7 @@ def fetch_full_market_universe(force_refresh: bool = False):
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
             if (datetime.now() - mtime).total_seconds() < 43200 and cached_label:
                 df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
-                if not df_cached.empty and len(df_cached) >= 50:
+                if not df_cached.empty and len(df_cached) >= 1000 and df_cached["stock_id"].str.startswith("00").any():
                     df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
                     return df_cached, cached_label
         except Exception:
@@ -152,6 +153,7 @@ def fetch_full_market_universe(force_refresh: bool = False):
     market_rows = []
     twse_raw_date_str = ""
 
+    # 1. 抓取證交所上市個股本益比／殖利率表
     pe_twse = {}
     try:
         r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=10)
@@ -170,33 +172,42 @@ def fetch_full_market_universe(force_refresh: bool = False):
     except Exception:
         pass
 
+    # 2. 抓取上市全部股票與 ETF 收盤行情
     try:
         r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=10)
         if r_p.status_code == 200:
             for row in r_p.json():
                 code = str(row.get("Code", "")).strip()
+                name = str(row.get("Name", "")).strip()
                 if not twse_raw_date_str and "Date" in row:
                     twse_raw_date_str = str(row["Date"])
-                if code in pe_twse:
+                
+                # 匹配標準個股與所有上市 ETF (0050, 0056, 00878, 00712, 00679B 等)
+                if re.match(r"^(00\d{2,3}[A-Za-z]?|[1-9]\d{3}[A-Za-z]?)$", code):
                     vol_shares = pd.to_numeric(str(row.get("TradeVolume", "")).replace(",", ""), errors="coerce")
                     close_p = pd.to_numeric(str(row.get("ClosingPrice", "")).replace(",", ""), errors="coerce")
                     vol_sheets = vol_shares / 1000.0 if pd.notnull(vol_shares) else 0.0
                     
-                    if pd.notnull(close_p) and close_p > 0 and vol_sheets >= 300:
-                        item = pe_twse[code]
+                    # 取消 300 張限制，只要有正常交易收盤價即收錄全市場母體
+                    if pd.notnull(close_p) and close_p > 0:
+                        item = pe_twse.get(code, {})
+                        is_etf = code.startswith("00")
+                        market_label = "上市 ETF" if is_etf else "上市"
+                        final_name = name if name else item.get("name", code)
                         market_rows.append({
                             "stock_id": code,
-                            "stock_name": item["name"],
-                            "market": "上市",
+                            "stock_name": final_name,
+                            "market": market_label,
                             "close": float(close_p),
                             "volume_sheets": float(vol_sheets),
-                            "pe_ratio": float(item["pe"]) if pd.notnull(item["pe"]) and item["pe"] > 0 else 22.0,
-                            "dividend_yield": float(item["dy"]) if pd.notnull(item["dy"]) else 2.5,
-                            "pb_ratio": float(item["pb"]) if pd.notnull(item["pb"]) else 2.0,
+                            "pe_ratio": float(item["pe"]) if pd.notnull(item.get("pe")) and item["pe"] > 0 else (np.nan if is_etf else 22.0),
+                            "dividend_yield": float(item["dy"]) if pd.notnull(item.get("dy")) else (np.nan if is_etf else 2.5),
+                            "pb_ratio": float(item["pb"]) if pd.notnull(item.get("pb")) else (np.nan if is_etf else 2.0),
                         })
     except Exception:
         pass
 
+    # 3. 抓取櫃買中心上櫃股票本益比與收盤行情 (完整納入 6903 巨漢與上櫃債券 ETF)
     try:
         r_otc_pe = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=headers, timeout=10)
         r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=10)
@@ -215,22 +226,25 @@ def fetch_full_market_universe(force_refresh: bool = False):
         if r_otc.status_code == 200:
             for row in r_otc.json():
                 code = str(row.get("SecuritiesCompanyCode", "")).strip()
-                if re.match(r"^[1-9]\d{3}$", code):
+                name = str(row.get("CompanyName", "")).strip()
+                if re.match(r"^(00\d{2,3}[A-Za-z]?|[1-9]\d{3}[A-Za-z]?)$", code):
                     vol_shares = pd.to_numeric(str(row.get("TradingShares", "")).replace(",", ""), errors="coerce")
                     close_p = pd.to_numeric(str(row.get("Close", "")).replace(",", ""), errors="coerce")
                     vol_sheets = vol_shares / 1000.0 if pd.notnull(vol_shares) else 0.0
                     
-                    if pd.notnull(close_p) and close_p > 0 and vol_sheets >= 300:
+                    if pd.notnull(close_p) and close_p > 0:
                         p_info = pe_otc.get(code, {})
+                        is_etf = code.startswith("00")
+                        market_label = "上櫃 ETF" if is_etf else "上櫃"
                         market_rows.append({
                             "stock_id": code,
-                            "stock_name": row.get("CompanyName", "").strip(),
-                            "market": "上櫃",
+                            "stock_name": name,
+                            "market": market_label,
                             "close": float(close_p),
                             "volume_sheets": float(vol_sheets),
-                            "pe_ratio": float(p_info.get("pe")) if pd.notnull(p_info.get("pe")) and p_info.get("pe") > 0 else 24.0,
-                            "dividend_yield": float(p_info.get("dy")) if pd.notnull(p_info.get("dy")) else 2.0,
-                            "pb_ratio": float(p_info.get("pb")) if pd.notnull(p_info.get("pb")) else 2.5,
+                            "pe_ratio": float(p_info.get("pe")) if pd.notnull(p_info.get("pe")) and p_info.get("pe") > 0 else (np.nan if is_etf else 24.0),
+                            "dividend_yield": float(p_info.get("dy")) if pd.notnull(p_info.get("dy")) else (np.nan if is_etf else 2.0),
+                            "pb_ratio": float(p_info.get("pb")) if pd.notnull(p_info.get("pb")) else (np.nan if is_etf else 2.5),
                         })
     except Exception:
         pass
@@ -262,26 +276,29 @@ def fetch_full_market_universe(force_refresh: bool = False):
     return full_df, actual_tw_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩
+# 3. 第一階段漏斗初篩 (自動推薦池排除 ETF，鎖定流動性優質普通股)
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35) -> pd.DataFrame:
-    df = full_df.copy()
+    # 推薦池排除 ETF (00開頭) 與極端流動性不足股 (日量 < 80 張)，保護推薦標的之流動性
+    df = full_df[~full_df["stock_id"].str.startswith("00") & (full_df["volume_sheets"] >= 80)].copy()
+    if df.empty:
+        df = full_df.copy()
     df["stage1_score"] = 0.0
 
     # 1. 基本面特化分流
     if selections["fundamental"]["enabled"]:
         lvl = selections["fundamental"]["level"]
         if lvl == "嚴格績優":
-            cond = (df["pe_ratio"] <= 18) & (df["dividend_yield"] >= 3.8)
-            score = cond.astype(int) * 35.0 + (df["dividend_yield"] * 3.0) - (df["pe_ratio"] * 0.4)
+            cond = (df["pe_ratio"].fillna(99) <= 18) & (df["dividend_yield"].fillna(0) >= 3.8)
+            score = cond.astype(int) * 35.0 + (df["dividend_yield"].fillna(0) * 3.0) - (df["pe_ratio"].fillna(30) * 0.4)
         elif lvl == "穩健成長":
-            cond = (df["pe_ratio"] >= 14) & (df["pe_ratio"] <= 27) & (df["dividend_yield"] >= 1.8)
-            pe_dist = (df["pe_ratio"] - 20.0).abs()
-            score = cond.astype(int) * 35.0 + 15.0 - (pe_dist * 1.2) + (df["dividend_yield"] * 1.5)
+            cond = (df["pe_ratio"].fillna(99) >= 14) & (df["pe_ratio"].fillna(99) <= 27) & (df["dividend_yield"].fillna(0) >= 1.8)
+            pe_dist = (df["pe_ratio"].fillna(20) - 20.0).abs()
+            score = cond.astype(int) * 35.0 + 15.0 - (pe_dist * 1.2) + (df["dividend_yield"].fillna(0) * 1.5)
         else:  # 價值轉機
-            cond = (df["pb_ratio"] <= 1.9) & (df["pe_ratio"] <= 38)
-            score = cond.astype(int) * 40.0 + (2.0 - df["pb_ratio"]).clip(lower=-1.0) * 20.0
-            score -= (df["pb_ratio"] > 3.0).astype(int) * 35.0
+            cond = (df["pb_ratio"].fillna(99) <= 1.9) & (df["pe_ratio"].fillna(99) <= 38)
+            score = cond.astype(int) * 40.0 + (2.0 - df["pb_ratio"].fillna(2.0)).clip(lower=-1.0) * 20.0
+            score -= (df["pb_ratio"].fillna(0) > 3.0).astype(int) * 35.0
         df["stage1_score"] += score
 
     # 2. 市場／籌碼面特化分流
@@ -330,8 +347,8 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         mid_target = round(last_close + 4.5 * last_atr, 2)
         mid_stop = round(last_ma60 * 0.97, 2)
 
-        summary_text = f"股價站穩月線之上呈多頭排列，RSI 動能達 {last_rsi:.1f}，法人與主流買盤進駐，短線價量配合良好。"
-        prediction_text = "**【宜買 / 逢回分批承接】** 此股多頭結構紮實，建議待股價小幅回測五日線或月線支撐不破時，採逢回分批承接策略。"
+        summary_text = f"價位站穩月線之上呈多頭排列，RSI 動能達 {last_rsi:.1f}，均線支撐力道強韌，價量配合良好。"
+        prediction_text = "**【宜買 / 逢回分批承接】** 多頭趨勢結構紮實，建議待價格小幅回測五日線或月線支撐不破時，採逢回分批承接策略。"
 
     elif is_bear:
         short_buy_low = round(last_close - 1.8 * last_atr, 2)
@@ -346,8 +363,8 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         mid_target = round(last_close + 3.0 * last_atr, 2)
         mid_stop = round(last_close - 2.8 * last_atr, 2)
 
-        summary_text = f"近日賣壓沉重，外資與主力連續調節，股價跌破關鍵月線且 RSI 偏弱（{last_rsi:.1f}），短線進入弱勢修正。"
-        prediction_text = "**【宜觀望 / 勿急於接刀】** 此股近日面臨修正壓力，現價風險較高。建議保持觀望，耐心等待股價回落至下方預估測撐區並出現止穩訊號再行評估。"
+        summary_text = f"近日承壓修正，價格跌破關鍵月線且 RSI 偏弱（{last_rsi:.1f}），短線結構進入整理或測撐階段。"
+        prediction_text = "**【宜觀望 / 勿急於接刀】** 目前面臨修正壓力，現價追入風險較高。建議保持觀望，耐心等待標的回測下方預估測撐區並出現止穩訊號再行評估。"
 
     else:
         short_buy_low = round(last_ma20 - 1.0 * last_atr, 2)
@@ -362,8 +379,8 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         mid_target = round(last_close + 3.5 * last_atr, 2)
         mid_stop = round(last_ma60 * 0.97, 2)
 
-        summary_text = f"已於月線附近區間震盪多日（RSI {last_rsi:.1f}），多空力量在此交戰拉鋸，成交量能溫和，靜待方向突破。"
-        prediction_text = "**【區間操作 / 保持彈性】** 此股目前處於箱型整理格局，方向尚未明朗。切勿追高現價，建議在建議買入區間（箱型下緣）低接、接近目標價時獲利調節。"
+        summary_text = f"於月線附近區間震盪（RSI {last_rsi:.1f}），多空力量在此交戰拉鋸，成交量能溫和，等待方向突破。"
+        prediction_text = "**【區間操作 / 保持彈性】** 目前處於箱型整理格局，方向尚未單邊明朗。切勿追高現價，建議在建議買入區間（箱型下緣）低接、接近目標價時獲利調節。"
 
     return {
         "short_buy_range": short_buy_range,
@@ -377,7 +394,7 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
     }
 
 # ==========================================
-# 5. 第二階段：精準技術指標與回測歷史運算 (已修復 float .abs() 與 .clip() 錯誤)
+# 5. 第二階段：精準技術指標與回測歷史運算
 # ==========================================
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     history_dict = {}
@@ -387,13 +404,17 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     np.random.seed(42)
 
     for idx, row in candidate_df.iterrows():
-        sid = row["stock_id"]
-        ticker = f"{sid}.TW" if row["market"] == "上市" else f"{sid}.TWO"
+        sid = str(row["stock_id"])
+        market_str = str(row["market"])
+        ticker = f"{sid}.TW" if "上市" in market_str else f"{sid}.TWO"
         hist_df = pd.DataFrame()
         
         try:
             raw = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
-            if not raw.empty and len(raw) > 65:
+            if raw.empty or len(raw) < 20:
+                alt = f"{sid}.TWO" if "TW" in ticker and "TWO" not in ticker else f"{sid}.TW"
+                raw = yf.download(alt, period="1y", progress=False, auto_adjust=True)
+            if not raw.empty and len(raw) > 20:
                 if isinstance(raw.columns, pd.MultiIndex):
                     raw.columns = raw.columns.get_level_values(0)
                 hist_df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
@@ -449,7 +470,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
-        # 技術面特化加權 (使用標準 Python 數值運算修復 AttributeError)
+        # 技術面特化加權
         tech_score = 0.0
         if selections["technical"]["enabled"]:
             lvl_t = selections["technical"]["level"]
@@ -461,7 +482,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
             elif lvl_t == "多頭排列":
                 if last_close >= last_ma20 and last_ma20 >= last_ma60:
                     tech_score = 30.0 + (15.0 - abs(last_rsi - 55.0))
-            else:  # 底部支撐反彈 (已修復 .abs() 與 .clip())
+            else:  # 底部支撐反彈
                 dist_to_ma60 = abs((last_close - last_ma60) / last_ma60) if last_ma60 > 0 else 0.0
                 if dist_to_ma60 <= 0.05 or last_rsi <= 45:
                     tech_score = 40.0 + max(50.0 - last_rsi, 0.0) * 0.8
@@ -471,7 +492,9 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
             tech_score = (last_rsi * 0.2) + (10.0 if last_close >= last_ma20 else 0.0)
 
         trend_desc = "呈多頭排列" if last_close >= last_ma20 else "回測均線支撐"
-        reason = f"本益比 {row['pe_ratio']:.1f} 倍、殖利率 {row['dividend_yield']:.1f}%，股價站穩關鍵均線{trend_desc}（RSI {last_rsi:.1f}，成交量 {int(row['volume_sheets']):,} 張）。"
+        pe_str = f"本益比 {row['pe_ratio']:.1f} 倍、" if pd.notnull(row['pe_ratio']) else ""
+        dy_str = f"殖利率 {row['dividend_yield']:.1f}%、" if pd.notnull(row['dividend_yield']) else ""
+        reason = f"{pe_str}{dy_str}股價站穩關鍵均線{trend_desc}（RSI {last_rsi:.1f}，成交量 {int(row['volume_sheets']):,} 張）。"
         
         enriched_rows.append({
             "stock_id": sid,
@@ -583,14 +606,14 @@ def generate_dynamic_analysis_texts(market_data: dict):
     nasdaq_pct = market_data.get("那斯達克綜合指數", {}).get("pct", 0.0)
     
     if tw_pct > 0.8:
-        today_summary = f"**【多方強勢表態，主流買氣匯聚】**\n\n今日台股加權指數開高走高，終場大漲約 {tw_pct:+.2f}%。權值股與主流AI/半導體族群同步點火，市場成交量能擴增，多方氣勢凌厲，盤面結構呈現健康的多頭排列。"
+        today_summary = f"**【多方強勢表態，主流買氣匯聚】**\n\n今日台股加權指數開高走高，終場大漲約 {tw_pct:+.2f}%。權值股與主流族群同步點火，成交量能擴增，多方氣勢凌厲，盤面結構呈現健康的多頭排列。"
     elif tw_pct < -0.8:
         today_summary = f"**【賣壓沉重，指數測撐調節】**\n\n今日台股受國際盤勢牽動或短線獲利回吐影響，指數開低走低，終場下挫約 {tw_pct:+.2f}%。權值科技股賣壓較重，資金轉入防禦型板塊，短線進入震盪測撐階段。"
     else:
-        today_summary = f"**【多空拉鋸膠着，量縮狹幅盤整】**\n\n今日台股呈現狹幅震盪格局（漲跌幅 {tw_pct:+.2f}%），市場觀望氣氛濃厚，權值熄火而中小型題材股各自表現，成交量能溫和，盤面多空交戰無明顯單邊方向。"
+        today_summary = f"**【多空拉鋸膠着，量縮狹幅盤整】**\n\n今日台股呈現狹幅震盪格局（漲跌幅 {tw_pct:+.2f}%），市場觀望氣氛濃厚，權值熄火而中小型題材股各自表現，成交量能溫和，多空交戰無明顯單邊方向。"
 
     if sox_pct < -1.2 or nasdaq_pct < -1.0:
-        tomorrow_pred = f"**【美股科技重挫：建議『高度觀望』，嚴控部位】**\n\n* **國際數據參考**：隔夜美股費城半導體指數下跌 {sox_pct:+.2f}%、那斯達克指數下跌 {nasdaq_pct:+.2f}%，科技與半導體供應鏈面臨沉重修正壓力。\n* **明日操作建議**：受美股科技股走弱拖累，台股明日早盤恐面臨壓力。建議投資人**暫時採取觀望或降低持股水位**，切勿躁進接刀，等待支撐止穩訊號出現。"
+        tomorrow_pred = f"**【美股科技重挫：建議『高度觀望』，嚴控部位】**\n\n* **國際數據參考**：隔夜美股費城半導體指數下跌 {sox_pct:+.2f}%、那斯達克指數下跌 {nasdaq_pct:+.2f}%，科技供應鏈面臨短線修正壓力。\n* **明日操作建議**：受國際科技股走弱拖累，早盤恐面臨壓力。建議投資人**暫時採取觀望或降低持股水位**，切勿躁進接刀，等待支撐止穩訊號出現。"
     elif sox_pct > 1.2 or nasdaq_pct > 1.0:
         tomorrow_pred = f"**【美股強勢彈升：建議『逢回分批承接』】**\n\n* **國際數據參考**：隔夜美股費城半導體指數大漲 {sox_pct:+.2f}%、科技股表現強勁，市場風險偏好回溫。\n* **明日操作建議**：國際半導體情緒轉佳，台股明日有望受到激勵開高。建議鎖定具備基本面優勢的強勢主流標的，採**逢回分批承接**策略積極佈局。"
     else:
@@ -634,18 +657,21 @@ def show_market_analysis_modal():
         st.rerun()
 
 # ==========================================
-# 9. 個股深度分析彈跳視窗
+# 9. 個股深度分析彈跳視窗 (全面支援 6903 巨漢與全量 ETF)
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
-    sid = row_match["stock_id"]
-    market = row_match["market"]
-    base_close = row_match["close"]
-    ticker = f"{sid}.TW" if market == "上市" else f"{sid}.TWO"
+    sid = str(row_match["stock_id"])
+    market = str(row_match["market"])
+    base_close = float(row_match.get("close", 100.0))
+    ticker = f"{sid}.TW" if "上市" in market else f"{sid}.TWO"
     
     hist_df = pd.DataFrame()
     try:
         raw = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
-        if not raw.empty and len(raw) > 30:
+        if raw.empty or len(raw) < 20:
+            alt_ticker = f"{sid}.TWO" if "TW" in ticker and "TWO" not in ticker else f"{sid}.TW"
+            raw = yf.download(alt_ticker, period="1y", progress=False, auto_adjust=True)
+        if not raw.empty and len(raw) > 20:
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(0)
             hist_df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
@@ -653,7 +679,7 @@ def get_single_stock_metrics(row_match, lookback_days):
         pass
         
     if hist_df.empty:
-        np.random.seed(int(sid))
+        np.random.seed(int(re.sub(r'\D', '', sid)) if re.sub(r'\D', '', sid) else 42)
         dates = pd.bdate_range(end=datetime.today(), periods=250)
         rets = np.random.normal(0.0006, 0.02, len(dates))
         price_path = base_close * np.exp(np.cumsum(rets - rets.mean() + 0.0006))
@@ -702,13 +728,18 @@ def get_single_stock_metrics(row_match, lookback_days):
     
     pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
     
+    pe_str = f"{row_match['pe_ratio']:.1f} 倍" if pd.notnull(row_match.get("pe_ratio")) and row_match["pe_ratio"] > 0 else "-"
+    dy_str = f"{row_match['dividend_yield']:.1f}%" if pd.notnull(row_match.get("dividend_yield")) and row_match["dividend_yield"] > 0 else "-"
+
     table_df = pd.DataFrame([{
         "代號": sid,
         "名稱": row_match["stock_name"],
-        "市場": market,
+        "類別/市場": market,
         "最新收盤價": round(last_close, 2),
         f"近{lookback_days}日報酬(%)": ret_period,
         "月線順勢勝率(%)": win_rate,
+        "本益比": pe_str,
+        "殖利率": dy_str,
         "短期建議買入": pricing["short_buy_range"],
         "短期目標賣出": pricing["short_target"],
         "中長建議買入": pricing["mid_buy_range"],
@@ -717,35 +748,61 @@ def get_single_stock_metrics(row_match, lookback_days):
 
     return table_df, pricing["summary_text"], pricing["prediction_text"]
 
-@st.dialog("📈 個股深度分析與行情預測", width="large")
+@st.dialog("📈 個股與 ETF 深度分析與行情預測", width="large")
 def show_single_stock_analysis_modal(full_universe_df, lookback_days):
     stock_options = [f"{row['stock_id']} - {row['stock_name']} ({row['market']})" for _, row in full_universe_df.iterrows()]
     
-    selected_str = st.selectbox(
-        "🔍 搜尋股票代號或名稱",
-        options=stock_options,
-        index=None,
-        placeholder="請輸入股票代號（如 2330）或名稱（如 台積電）搜尋..."
-    )
+    col_sel, col_manual = st.columns([3, 2])
+    with col_sel:
+        selected_str = st.selectbox(
+            "🔍 下拉搜尋股票或 ETF",
+            options=stock_options,
+            index=None,
+            placeholder="請輸入代號 (如 2330、6903、0050、00878) 或名稱搜尋..."
+        )
+    with col_manual:
+        manual_code = st.text_input(
+            "⌨️ 或直接輸入代號查詢",
+            placeholder="例如: 6903、0050、00878、00989B",
+            help="若在選單未及時找到，可直接輸入代號按 Enter 立即進行深度分析"
+        ).strip().upper()
     
-    if selected_str:
+    target_row = None
+    if manual_code:
+        matches = full_universe_df[full_universe_df["stock_id"] == manual_code]
+        if not matches.empty:
+            target_row = matches.iloc[0].to_dict()
+        else:
+            # 代號未在快取清單時之動態自動建立機制
+            is_etf = manual_code.startswith("00")
+            target_row = {
+                "stock_id": manual_code,
+                "stock_name": f"{manual_code} (指定標的)",
+                "market": "上市 ETF" if is_etf else "上市",
+                "close": 100.0,
+                "pe_ratio": np.nan,
+                "dividend_yield": np.nan,
+                "volume_sheets": 1000.0
+            }
+    elif selected_str:
         sid = selected_str.split(" - ")[0]
-        row_match = full_universe_df[full_universe_df["stock_id"] == sid].iloc[0]
-        
+        target_row = full_universe_df[full_universe_df["stock_id"] == sid].iloc[0].to_dict()
+
+    if target_row:
         st.markdown("---")
-        st.markdown(f"### 🎯 分析標的：`{row_match['stock_id']}` **{row_match['stock_name']}** ({row_match['market']})")
+        st.markdown(f"### 🎯 分析標的：`{target_row['stock_id']}` **{target_row['stock_name']}** ({target_row['market']})")
         
-        with st.spinner(f"正在運算 {row_match['stock_id']} {row_match['stock_name']} 的量化指標與買賣建議..."):
-            stock_table_df, summary_text, prediction_text = get_single_stock_metrics(row_match, lookback_days)
+        with st.spinner(f"正在運算 {target_row['stock_id']} {target_row['stock_name']} 的量化指標與買賣建議..."):
+            stock_table_df, summary_text, prediction_text = get_single_stock_metrics(target_row, lookback_days)
             
-        st.markdown("#### 📋 1. 個股核心數據總覽")
+        st.markdown("#### 📋 1. 核心量化指標總覽")
         st.dataframe(stock_table_df, use_container_width=True, hide_index=True)
-        st.info(f"💡 **個股盤勢總結**：{summary_text}")
+        st.info(f"💡 **標的盤勢總結**：{summary_text}")
         
         st.markdown("#### 🔮 2. 後續行情預測與操作指引")
         st.warning(prediction_text)
     else:
-        st.info("👆 請於上方輸入框輸入股票代號或名稱，選取後系統將自動開始量化運算並產出買賣指引。")
+        st.info("👆 請於上方選單搜尋股票/ETF 名稱，或直接輸入代號（支援全上市櫃個股與所有 ETF），系統將自動啟動量化運算。")
         
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("關閉視窗", use_container_width=True):
@@ -881,7 +938,7 @@ with col_h3:
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
 with col_stock_btn_2:
-    if st.button("📈 查詢與分析指定個股（個股分析）", key="btn_single_stock_analysis", use_container_width=True):
+    if st.button("📈 查詢與分析指定個股 / ETF（個股分析）", key="btn_single_stock_analysis", use_container_width=True):
         show_single_stock_analysis_modal(full_universe_df, lookback)
 st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
 
