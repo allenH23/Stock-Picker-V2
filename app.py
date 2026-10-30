@@ -131,10 +131,9 @@ def parse_tw_roc_date(roc_date_str: str) -> str:
     return f"{tw_now.strftime('%Y-%m-%d')} ({weekday_map.get(tw_now.weekday(), '')})"
 
 # ==========================================
-# 2. 全市場真實數據擷取與 Parquet 磁碟快取 (含全股票與全ETF支援)
+# 2. 全市場真實數據擷取與 Parquet 磁碟快取
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
-    # 快取驗證：除了時間外，必須包含 ETF (00開頭) 資料，否則判定為舊版快取並自動重新同步
     if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
             with open(META_JSON_FILE, "r", encoding="utf-8") as f:
@@ -153,7 +152,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
     market_rows = []
     twse_raw_date_str = ""
 
-    # 1. 抓取證交所上市個股本益比／殖利率表
     pe_twse = {}
     try:
         r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=10)
@@ -172,7 +170,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
     except Exception:
         pass
 
-    # 2. 抓取上市全部股票與 ETF 收盤行情
     try:
         r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=10)
         if r_p.status_code == 200:
@@ -182,13 +179,11 @@ def fetch_full_market_universe(force_refresh: bool = False):
                 if not twse_raw_date_str and "Date" in row:
                     twse_raw_date_str = str(row["Date"])
                 
-                # 匹配標準個股與所有上市 ETF (0050, 0056, 00878, 00712, 00679B 等)
                 if re.match(r"^(00\d{2,3}[A-Za-z]?|[1-9]\d{3}[A-Za-z]?)$", code):
                     vol_shares = pd.to_numeric(str(row.get("TradeVolume", "")).replace(",", ""), errors="coerce")
                     close_p = pd.to_numeric(str(row.get("ClosingPrice", "")).replace(",", ""), errors="coerce")
                     vol_sheets = vol_shares / 1000.0 if pd.notnull(vol_shares) else 0.0
                     
-                    # 取消 300 張限制，只要有正常交易收盤價即收錄全市場母體
                     if pd.notnull(close_p) and close_p > 0:
                         item = pe_twse.get(code, {})
                         is_etf = code.startswith("00")
@@ -207,7 +202,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
     except Exception:
         pass
 
-    # 3. 抓取櫃買中心上櫃股票本益比與收盤行情 (完整納入 6903 巨漢與上櫃債券 ETF)
     try:
         r_otc_pe = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=headers, timeout=10)
         r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=10)
@@ -276,16 +270,14 @@ def fetch_full_market_universe(force_refresh: bool = False):
     return full_df, actual_tw_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩 (自動推薦池排除 ETF，鎖定流動性優質普通股)
+# 3. 第一階段漏斗初篩
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35) -> pd.DataFrame:
-    # 推薦池排除 ETF (00開頭) 與極端流動性不足股 (日量 < 80 張)，保護推薦標的之流動性
     df = full_df[~full_df["stock_id"].str.startswith("00") & (full_df["volume_sheets"] >= 80)].copy()
     if df.empty:
         df = full_df.copy()
     df["stage1_score"] = 0.0
 
-    # 1. 基本面特化分流
     if selections["fundamental"]["enabled"]:
         lvl = selections["fundamental"]["level"]
         if lvl == "嚴格績優":
@@ -301,7 +293,6 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35)
             score -= (df["pb_ratio"].fillna(0) > 3.0).astype(int) * 35.0
         df["stage1_score"] += score
 
-    # 2. 市場／籌碼面特化分流
     if selections["market"]["enabled"]:
         lvl = selections["market"]["level"]
         if lvl == "法人重倉連買":
@@ -315,7 +306,6 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 35)
             score = cond.astype(int) * 40.0 - (df["volume_sheets"] > 3000).astype(int) * 35.0
         df["stage1_score"] += score
 
-    # 3. 熱門題材加權
     if selections["theme"]["enabled"]:
         lvl = selections["theme"]["level"]
         target = lvl
@@ -394,7 +384,33 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
     }
 
 # ==========================================
-# 5. 第二階段：精準技術指標與回測歷史運算
+# 5. 獨立 K 線歷史資料記憶體快取模組 (快取 4 小時)
+# ==========================================
+@st.cache_data(ttl=14400, show_spinner=False)
+def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
+    """針對單一股票代號抓取近 1 年日 K 線，並由 Streamlit 記憶體自動快取。"""
+    sid = str(sid).strip()
+    market_str = str(market_str).strip()
+    ticker = f"{sid}.TW" if "上市" in market_str else f"{sid}.TWO"
+    hist_df = pd.DataFrame()
+    
+    try:
+        raw = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
+        if raw.empty or len(raw) < 20:
+            alt_ticker = f"{sid}.TWO" if "TW" in ticker and "TWO" not in ticker else f"{sid}.TW"
+            raw = yf.download(alt_ticker, period="1y", progress=False, auto_adjust=True)
+            
+        if not raw.empty and len(raw) > 20:
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            hist_df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+    except Exception:
+        hist_df = pd.DataFrame()
+        
+    return hist_df
+
+# ==========================================
+# 6. 第二階段：精準技術指標與回測歷史運算 (整合記憶體快取)
 # ==========================================
 def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     history_dict = {}
@@ -405,21 +421,9 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
 
     for idx, row in candidate_df.iterrows():
         sid = str(row["stock_id"])
-        market_str = str(row["market"])
-        ticker = f"{sid}.TW" if "上市" in market_str else f"{sid}.TWO"
-        hist_df = pd.DataFrame()
         
-        try:
-            raw = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
-            if raw.empty or len(raw) < 20:
-                alt = f"{sid}.TWO" if "TW" in ticker and "TWO" not in ticker else f"{sid}.TW"
-                raw = yf.download(alt, period="1y", progress=False, auto_adjust=True)
-            if not raw.empty and len(raw) > 20:
-                if isinstance(raw.columns, pd.MultiIndex):
-                    raw.columns = raw.columns.get_level_values(0)
-                hist_df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-        except Exception:
-            hist_df = pd.DataFrame()
+        # 🟢 調用記憶體快取，切換批次與調整天數時秒讀傳回
+        hist_df = get_cached_stock_kline(sid, row["market"])
             
         if hist_df.empty:
             drift = 0.0006
@@ -470,7 +474,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
-        # 技術面特化加權
         tech_score = 0.0
         if selections["technical"]["enabled"]:
             lvl_t = selections["technical"]["level"]
@@ -520,7 +523,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     return final_df, history_dict
 
 # ==========================================
-# 6. 回測引擎
+# 7. 回測引擎
 # ==========================================
 def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookback_days: int = 120):
     close_matrix = pd.DataFrame()
@@ -572,7 +575,7 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 7. 即時國際指數抓取與大盤預測模組
+# 8. 即時國際指數抓取與大盤預測模組
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_live_market_data():
@@ -622,7 +625,7 @@ def generate_dynamic_analysis_texts(market_data: dict):
     return today_summary, tomorrow_pred
 
 # ==========================================
-# 8. 盤勢分析與預測彈跳視窗
+# 9. 盤勢分析與預測彈跳視窗
 # ==========================================
 @st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
 def show_market_analysis_modal():
@@ -657,26 +660,15 @@ def show_market_analysis_modal():
         st.rerun()
 
 # ==========================================
-# 9. 個股深度分析彈跳視窗 (全面支援 6903 巨漢與全量 ETF)
+# 10. 個股深度分析彈跳視窗 (整合快取)
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
     sid = str(row_match["stock_id"])
     market = str(row_match["market"])
     base_close = float(row_match.get("close", 100.0))
-    ticker = f"{sid}.TW" if "上市" in market else f"{sid}.TWO"
     
-    hist_df = pd.DataFrame()
-    try:
-        raw = yf.download(ticker, period="1y", progress=False, auto_adjust=True)
-        if raw.empty or len(raw) < 20:
-            alt_ticker = f"{sid}.TWO" if "TW" in ticker and "TWO" not in ticker else f"{sid}.TW"
-            raw = yf.download(alt_ticker, period="1y", progress=False, auto_adjust=True)
-        if not raw.empty and len(raw) > 20:
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = raw.columns.get_level_values(0)
-            hist_df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
-    except Exception:
-        pass
+    # 🟢 調用記憶體快取
+    hist_df = get_cached_stock_kline(sid, market)
         
     if hist_df.empty:
         np.random.seed(int(re.sub(r'\D', '', sid)) if re.sub(r'\D', '', sid) else 42)
@@ -773,7 +765,6 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days):
         if not matches.empty:
             target_row = matches.iloc[0].to_dict()
         else:
-            # 代號未在快取清單時之動態自動建立機制
             is_etf = manual_code.startswith("00")
             target_row = {
                 "stock_id": manual_code,
@@ -809,7 +800,7 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days):
         st.rerun()
 
 # ==========================================
-# 10. Streamlit 互動網頁主介面
+# 11. Streamlit 互動網頁主介面
 # ==========================================
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
@@ -895,6 +886,7 @@ with st.sidebar:
         
     if st.button("🔄 強制重新抓取並更新快取", use_container_width=True):
         st.session_state.force_refresh_cache = True
+        st.cache_data.clear()  # 🟢 同步清空記憶體二級快取
         st.rerun()
 
 current_config_key = f"{use_fund}_{lvl_fund}_{use_tech}_{lvl_tech}_{use_mkt}_{lvl_mkt}_{use_theme}_{lvl_theme}_{st.session_state.theme_last_update}"
@@ -902,7 +894,8 @@ if st.session_state.get("last_config_key") != current_config_key:
     st.session_state.batch_page = 0
     st.session_state.last_config_key = current_config_key
 
-with st.spinner("🚀 正在載入全市場大數據並計算 K 線指標..."):
+# 🟢 優化後更精準的 Spinner 載入提示語
+with st.spinner("🚀 正在讀取全市場資料並計算候選標的技術指標..."):
     force_run = st.session_state.force_refresh_cache
     full_universe_df, tw_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
