@@ -10,61 +10,81 @@ import os
 import json
 
 # ==========================================
-# 頁面基本設定與手機版 UI 樣式優化
+# 頁面基本設定與手機專屬極簡 CSS 注入
 # ==========================================
 st.set_page_config(
-    page_title="智慧選股系統",
+    page_title="智慧選股",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
 st.markdown("""
     <style>
-    [data-testid="collapsedControl"] {
-        transform: scale(1.4);
-        transform-origin: top left;
-        margin-left: 10px;
-        margin-top: 10px;
+    /* 隱藏側邊欄切換鈕，打造全 App 沉浸體驗 */
+    [data-testid="collapsedControl"] { display: none !important; }
+    
+    /* 頂部極簡標題樣式 */
+    .mobile-header {
+        text-align: center;
+        padding-top: 15px;
+        padding-bottom: 25px;
+    }
+    .mobile-header h1 {
+        font-size: 2.3rem !important;
+        font-weight: 800 !important;
         color: #1a73e8;
+        letter-spacing: 1px;
+        margin: 0;
     }
-    .disclaimer-banner {
-        padding: 12px 16px;
-        background-color: #f8f9fa;
-        border-left: 4px solid #f44336;
-        border-radius: 4px;
-        font-size: 0.85rem;
-        color: #555555;
-        margin-top: 25px;
-        margin-bottom: 25px;
+    
+    /* 超大按鈕卡片樣式注入 */
+    div.st-key-btn_nav_market button,
+    div.st-key-btn_nav_stock button,
+    div.st-key-btn_nav_picks button {
+        height: 115px !important;
+        border-radius: 18px !important;
+        margin-bottom: 20px !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        justify-content: center !important;
+        border: none !important;
+        box-shadow: 0 6px 16px rgba(0,0,0,0.08) !important;
+        transition: all 0.25s ease !important;
     }
-    div.st-key-btn_single_stock_analysis button,
-    button[aria-label*="個股分析"] {
-        background-color: #1a73e8 !important;
-        background: #1a73e8 !important;
+    
+    /* 1. 盤勢分析按鈕（漸層紫靛） */
+    div.st-key-btn_nav_market button {
+        background: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%) !important;
+    }
+    /* 2. 個股分析按鈕（極光藍） */
+    div.st-key-btn_nav_stock button {
+        background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%) !important;
+    }
+    /* 3. 精選推薦按鈕（翡翠綠） */
+    div.st-key-btn_nav_picks button {
+        background: linear-gradient(135deg, #059669 0%, #047857 100%) !important;
+    }
+    
+    /* 超大按鈕文字與字型大小 */
+    div.st-key-btn_nav_market button p, div.st-key-btn_nav_market button span,
+    div.st-key-btn_nav_stock button p, div.st-key-btn_nav_stock button span,
+    div.st-key-btn_nav_picks button p, div.st-key-btn_nav_picks button span {
         color: #ffffff !important;
-        border: 1px solid #1a73e8 !important;
-        border-radius: 8px !important;
-        box-shadow: 0 4px 10px rgba(26, 115, 232, 0.35) !important;
-        transition: all 0.2s ease-in-out !important;
-    }
-    div.st-key-btn_single_stock_analysis button p,
-    div.st-key-btn_single_stock_analysis button span,
-    button[aria-label*="個股分析"] p,
-    button[aria-label*="個股分析"] span {
-        color: #ffffff !important;
+        font-size: 1.55rem !important;
         font-weight: 700 !important;
-        font-size: 1.05rem !important;
+        letter-spacing: 0.8px !important;
     }
-    div.st-key-btn_single_stock_analysis button:hover,
-    button[aria-label*="個股分析"]:hover {
-        background-color: #1557b0 !important;
-        background: #1557b0 !important;
-        border-color: #1557b0 !important;
-        box-shadow: 0 6px 14px rgba(21, 87, 176, 0.45) !important;
-    }
-    div.st-key-btn_single_stock_analysis button:hover p,
-    button[aria-label*="個股分析"]:hover p {
-        color: #ffffff !important;
+    
+    /* 底部次要功能列樣式 */
+    .footer-bar {
+        text-align: center;
+        margin-top: 40px;
+        padding-top: 15px;
+        border-top: 1px solid #e2e8f0;
+        font-size: 0.85rem;
+        color: #718096;
     }
     </style>
 """, unsafe_allow_html=True)
@@ -73,20 +93,18 @@ CACHE_PARQUET_FILE = "market_cache.parquet"
 META_JSON_FILE = "market_cache_meta.json"
 
 # ==========================================
-# 0. 法律免責聲明彈窗 (僅備查，不強制彈出)
+# 0. 法律免責聲明彈窗 (置底備查)
 # ==========================================
 @st.dialog("⚖️ 投資風險與法律免責聲明", width="large")
 def show_legal_disclaimer_modal():
     st.markdown("### ⚠️ 使用者須知與風險宣告")
     st.markdown("""
-    感謝您使用**「智慧選股系統」**（以下簡稱「本系統」）。在使用本系統提供的任何資訊、數據、指標及分析工具前，請仔細閱讀以下法律聲明：
+    本系統所載之所有選股結果、策略回測、買賣建議區間及盤勢分析，均基於歷史盤後公開數據及量化演算法運算呈現，**僅供學術研究、量化模型驗證與教育模擬用途**，不構成任何形式的投資招攬、買賣建議或金融顧問服務。
     
-    1. **非證券投資顧問業務**：本系統所載之所有選股結果、策略回測、買賣建議區間及盤勢分析，均基於歷史盤後公開數據及量化演算法運算呈現，**僅供學術研究、量化模型驗證與教育模擬用途**，不構成任何形式的投資招攬、買賣建議或金融顧問服務。
-    2. **歷史績效不保證未來獲利**：過往之技術指標表現、勝率統計或歷史回測曲線，均不代表亦不保證未來之實際投資報酬。金融市場受國內外政經情勢、總體經濟及突發事件等多重不可抗力因素影響，風險難以完全預估。
-    3. **獨立審慎評估與風險自負**：本系統所引用之即時或盤後數據源自台灣證券交易所、證券櫃檯買賣中心及第三方資訊服務商，本系統力求數據之客觀與正確，但對數據延遲、遺漏或計算偏差不負法律保證責任。**使用者應依個人財務狀況、風險承受能力獨立判斷並自負投資盈虧責任**。
+    金融市場受國內外政經情勢、總體經濟及突發事件等多重不可抗力因素影響，風險難以完全預估。**使用者應依個人財務狀況、風險承受能力獨立判斷並自負投資盈虧責任**。
     """)
     st.markdown("---")
-    if st.button("關閉聲明", use_container_width=True):
+    if st.button("關閉", use_container_width=True):
         st.rerun()
 
 # ==========================================
@@ -245,7 +263,7 @@ def fetch_full_market_universe(force_refresh: bool = False):
     full_df = pd.DataFrame(market_rows)
 
     if full_df.empty or len(full_df) < 50:
-        st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線或稍後再試。")
+        st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線。")
         st.stop()
 
     actual_tw_label = parse_tw_roc_date(twse_raw_date_str)
@@ -269,7 +287,7 @@ def fetch_full_market_universe(force_refresh: bool = False):
     return full_df, actual_tw_label
 
 # ==========================================
-# 3. 第一階段漏斗初篩 (精確收斂為 25 檔候選股)
+# 3. 第一階段漏斗初篩
 # ==========================================
 def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25) -> pd.DataFrame:
     df = full_df[~full_df["stock_id"].str.startswith("00") & (full_df["volume_sheets"] >= 80)].copy()
@@ -417,7 +435,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     dates = pd.bdate_range(end=datetime.today(), periods=250)
     np.random.seed(42)
 
-    # 1. 識別使用者目前實際啟用的面向清單 (動態分母)
     active_factors = []
     if selections["fundamental"]["enabled"]:
         active_factors.append("fund")
@@ -486,9 +503,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
-        # ------------------------------------------
-        # 2. 技術面特化加權 (含非線性指數型加分)
-        # ------------------------------------------
+        # 1. 技術面特化加權
         tech_score = 0.0
         tech_hit = False
         if selections["technical"]["enabled"]:
@@ -517,57 +532,41 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
 
         base_combined_score = row["stage1_score"] + tech_score
 
-        # ------------------------------------------
-        # 3. 自適應動態共振判定 (只看實際啟用的面向)
-        # ------------------------------------------
+        # 2. 自適應動態共振判定
         hit_count = 0
         if "fund" in active_factors:
-            # 基本面達標：依據第一階段評分門檻判定
             hit_count += int(row["stage1_score"] >= 25.0)
-
         if "tech" in active_factors:
-            # 技術面達標：完全符合該等級之主訊號或站穩月線
             hit_count += int(tech_hit or (last_close >= last_ma20 and last_rsi >= 50.0))
-
         if "mkt" in active_factors:
-            # 籌碼面達標：量比顯著放大或絕對成交張數充足
             hit_count += int(vol_ratio >= 1.25 or row["volume_sheets"] >= 2000.0)
-
         if "theme" in active_factors:
-            # 題材面達標：股票題材清單精確命中選取之主題
             stock_themes = get_stock_themes(sid)
             hit_count += int(any(selections["theme"]["level"] in t for t in stock_themes))
 
-        # 計算動態乘數
         if total_active > 0:
             hit_ratio = hit_count / float(total_active)
             if hit_ratio == 1.0:
-                multiplier = 1.35  # 所有勾選條件 100% 完美共振
+                multiplier = 1.35
             elif hit_ratio >= 0.5:
-                multiplier = 1.15  # 過半條件達標
+                multiplier = 1.15
             else:
-                multiplier = 1.0   # 未達半數
+                multiplier = 1.0
         else:
             multiplier = 1.0
 
         scaled_score = base_combined_score * multiplier
 
-        # ------------------------------------------
-        # 4. 破壞性扣分項 (不論勾選面向為何，均過濾高風險結構)
-        # ------------------------------------------
+        # 3. 破壞性扣分項
         penalties = 0.0
-        
-        # (1) 高檔正乖離過大（防止追高被套）
         bias_ma20 = (last_close - last_ma20) / last_ma20 if last_ma20 > 0 else 0.0
         if bias_ma20 > 0.15:
             penalties += 25.0
             
-        # (2) 量價背離（創近 10 日新高但量能急縮逾 30%）
         highest_10d = float(c.iloc[-10:].max()) if len(c) >= 10 else last_close
         if last_close >= highest_10d * 0.99 and vol_ratio < 0.70:
             penalties += 20.0
 
-        # (3) 季線下彎蓋頭且股價在季線之下
         ma60_slope_down = (last_ma60 < prev_ma60)
         if ma60_slope_down and last_close < last_ma60:
             penalties += 25.0
@@ -655,7 +654,7 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 8. 即時國際指數抓取與大盤預測模組
+# 8. 即時國際指數抓取與 6 大細分情境盤勢指引
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_live_market_data():
@@ -688,39 +687,81 @@ def generate_dynamic_analysis_texts(market_data: dict):
     sox_pct = market_data.get("費城半導體指數", {}).get("pct", 0.0)
     nasdaq_pct = market_data.get("那斯達克綜合指數", {}).get("pct", 0.0)
     
+    # ----------------------------------------------------
+    # 今日台股盤勢總結 (依照盤勢強度分為三大類)
+    # ----------------------------------------------------
     if tw_pct > 0.8:
-        today_summary = f"**【多方強勢表態，主流買氣匯聚】**\n\n今日台股加權指數開高走高，終場大漲約 {tw_pct:+.2f}%。權值股與主流族群同步點火，成交量能擴增，多方氣勢凌厲，盤面結構呈現健康的多頭排列。"
+        today_summary = f"**【多方強勢表態，主流買氣匯聚】**\n\n今日台股大漲約 {tw_pct:+.2f}%。權值股與半導體供應鏈同步放量點火，買盤氣勢凌厲，盤面結構健康向上延伸。"
     elif tw_pct < -0.8:
-        today_summary = f"**【賣壓沉重，指數測撐調節】**\n\n今日台股受國際盤勢牽動或短線獲利回吐影響，指數開低走低，終場下挫約 {tw_pct:+.2f}%。權值科技股賣壓較重，資金轉入防禦型板塊，短線進入震盪測撐階段。"
+        today_summary = f"**【空方賣壓沉重，指數測撐調節】**\n\n今日台股下挫約 {tw_pct:+.2f}%。權值科技股受外圍影響承壓回檔，資金防禦心態濃厚，短線結構進入震盪測撐階段。"
     else:
-        today_summary = f"**【多空拉鋸膠着，量縮狹幅盤整】**\n\n今日台股呈現狹幅震盪格局（漲跌幅 {tw_pct:+.2f}%），市場觀望氣氛濃厚，權值熄火而中小型題材股各自表現，成交量能溫和，多空交戰無明顯單邊方向。"
+        today_summary = f"**【多空膠著拉鋸，量縮狹幅盤整】**\n\n今日台股呈現整理格局（漲跌 {tw_pct:+.2f}%），市場觀望氣氛較濃，個股各憑題材表現，未出現單邊方向。"
 
-    if sox_pct < -1.2 or nasdaq_pct < -1.0:
-        tomorrow_pred = f"**【美股科技重挫：建議『高度觀望』，嚴控部位】**\n\n* **國際數據參考**：隔夜美股費城半導體指數下跌 {sox_pct:+.2f}%、那斯達克指數下跌 {nasdaq_pct:+.2f}%，科技供應鏈面臨短線修正壓力。\n* **明日操作建議**：受國際科技股走弱拖累，早盤恐面臨壓力。建議投資人**暫時採取觀望或降低持股水位**，切勿躁進接刀，等待支撐止穩訊號出現。"
-    elif sox_pct > 1.2 or nasdaq_pct > 1.0:
-        tomorrow_pred = f"**【美股強勢彈升：建議『逢回分批承接』】**\n\n* **國際數據參考**：隔夜美股費城半導體指數大漲 {sox_pct:+.2f}%、科技股表現強勁，市場風險偏好回溫。\n* **明日操作建議**：國際半導體情緒轉佳，台股明日有望受到激勵開高。建議鎖定具備基本面優勢的強勢主流標的，採**逢回分批承接**策略積極佈局。"
+    # ----------------------------------------------------
+    # 明日操作指引：細分為 6 種情境判定
+    # ----------------------------------------------------
+    if sox_pct < -2.2 or (tw_pct < -1.5 and sox_pct < -1.5):
+        # 情境 1：恐慌修正
+        tomorrow_pred = (
+            f"🛡️ **【情境：恐慌重挫修正】➔ 操作方向：『現金為王，嚴控部位防破線』**\n\n"
+            f"* **量化訊號**：隔夜費半指數重挫 `{sox_pct:+.2f}%`、那斯達克變動 `{nasdaq_pct:+.2f}%`，國際系統性賣壓升高。\n"
+            f"* **具體指引**：早盤台股電子股恐面臨連鎖回測壓力。**極度建議保持空手或將持股水位降至 3 成以下**，嚴禁向下攤平或躁進接刀，耐心等待恐慌賣壓宣洩。"
+        )
+    elif sox_pct < -0.8 or nasdaq_pct < -0.8:
+        # 情境 2：弱勢整理
+        tomorrow_pred = (
+            f"⚠️ **【情境：外盤承壓震盪】➔ 操作方向：『高度觀望，靜待下檔止穩訊號』**\n\n"
+            f"* **量化訊號**：美股科技板塊走弱（費半 `{sox_pct:+.2f}%`），供應鏈受壓。\n"
+            f"* **具體指引**：指數短線恐有回測 5 日線或月線支撐之虞。現階段**建議暫採觀望**，若手中持股跌破關鍵短均線應落實停損，切勿隨意追逐開盤反彈。"
+        )
+    elif tw_pct > 1.0 and (sox_pct < -0.2 or nasdaq_pct < -0.2):
+        # 情境 3：高檔背離
+        tomorrow_pred = (
+            f"🔄 **【情境：高檔背離輪動】➔ 操作方向：『嚴防追高風險，短線逢高獲利調節』**\n\n"
+            f"* **量化訊號**：台股今日雖強（`{tw_pct:+.2f}%`），但美股科技股並未同步跟進（費半 `{sox_pct:+.2f}%`），出現步調分歧。\n"
+            f"* **具體指引**：明日早盤若開高容易引發隔日沖或短線獲利了結賣壓。**不宜追買正乖離已大之熱門股**，建議逢高分批調節獲利，拉回至月線附近再行審視。"
+        )
+    elif abs(sox_pct) <= 0.8 and abs(tw_pct) <= 0.8:
+        # 情境 4：箱型橫盤
+        tomorrow_pred = (
+            f"⚖️ **【情境：多空均衡整理】➔ 操作方向：『區間來回操作，鎖定具基本面支撐標的』**\n\n"
+            f"* **量化訊號**：國際指數窄幅波動（費半 `{sox_pct:+.2f}%`），大盤方向尚未明朗。\n"
+            f"* **具體指引**：大盤空間有限，但具備個股表現機會。操作宜**『買黑不買紅』**，在支撐區（月線下緣）逢低承接、接近壓力區時適度獲利落袋。"
+        )
+    elif sox_pct > 1.8 and nasdaq_pct > 1.2:
+        # 情境 5：強多噴出
+        tomorrow_pred = (
+            f"🚀 **【情境：強大多方共振】➔ 操作方向：『積極偏多操作，緊盯主流強勢領頭羊』**\n\n"
+            f"* **量化訊號**：隔夜費半大漲 `{sox_pct:+.2f}%`，國際科技風險偏好爆發，外資熱錢回流可期。\n"
+            f"* **具體指引**：明日早盤有望跳空開高。建議順應強多趨勢，**聚焦符合『三因子共振』之高評分主流領漲標的**，開盤後若量能持續放大可順勢偏多佈局。"
+        )
     else:
-        tomorrow_pred = f"**【國際盤勢平穩：建議『區間操作、精選個股』】**\n\n* **國際數據參考**：美股主要指數維持高檔震盪（費城半導體指數變動 {sox_pct:+.2f}%），國際無重大系統性風險。\n* **明日操作建議**：明日大盤預期延續類股輪動格局，指數空間有限。建議依循選股系統篩選基本面與籌碼優異個股，進行**短線區間操作**。"
+        # 情境 6：穩健多頭
+        tomorrow_pred = (
+            f"🟢 **【情境：溫和震盪趨堅】➔ 操作方向：『逢回分批承接，沿短均線偏多布局』**\n\n"
+            f"* **量化訊號**：美股維持穩健（費半 `{sox_pct:+.2f}%`），台股多頭架構未變。\n"
+            f"* **具體指引**：指數結構偏多但非全面暴衝，盤面採良性類股輪動。操作建議**逢回檔至 5 日線或支撐區時分批佈局**，持股續抱多頭排列個股。"
+        )
 
     return today_summary, tomorrow_pred
 
 # ==========================================
 # 9. 盤勢分析與預測彈跳視窗
 # ==========================================
-@st.dialog("📊 今日盤勢分析與明日行情預測", width="large")
+@st.dialog("📊 盤勢分析與行情預測", width="large")
 def show_market_analysis_modal():
     with st.spinner("正在連線抓取全球最新盤後市場數據並運算分析中..."):
         market_data = get_live_market_data()
         today_txt, tomorrow_txt = generate_dynamic_analysis_texts(market_data)
     
-    st.markdown("### 📌 1. 今日台股盤勢總結")
+    st.markdown("#### 📌 1. 今日台股盤勢總結")
     st.info(today_txt)
     
-    st.markdown("### 🔮 2. 明日大盤走勢預測與操作指引")
+    st.markdown("#### 🔮 2. 明日大盤走勢預測與操作指引")
     st.warning(tomorrow_txt)
     
     st.markdown("---")
-    st.markdown("### 🌐 全球核心市場指數數據")
+    st.markdown("#### 🌐 全球核心市場指數數據")
     if market_data:
         cols = st.columns(len(market_data))
         for i, (chinese_name, v) in enumerate(market_data.items()):
@@ -730,9 +771,7 @@ def show_market_analysis_modal():
     tw_date = market_data.get("台灣加權指數", {}).get("date", "最新交易日")
     us_date = market_data.get("費城半導體指數", {}).get("date", "最新交易日")
     st.caption(
-        f"🕒 **市場數據來源與結算日期標記**：\n"
-        f"• **台股行情來源**：`TWSE/TPEx OpenAPI` & `^TWII` ｜ 結算日期：`{tw_date}` 盤後\n"
-        f"• **美股指數來源**：`Yahoo Finance (^SOX, ^IXIC, ^DJI)` ｜ 結算日期：`{us_date}` 昨收"
+        f"🕒 **市場數據標記**：台股行情基準：`{tw_date}` 盤後 ｜ 美股指數基準：`{us_date}` 昨收"
     )
     
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
@@ -805,8 +844,8 @@ def get_single_stock_metrics(row_match, lookback_days):
     table_df = pd.DataFrame([{
         "代號": sid,
         "名稱": row_match["stock_name"],
-        "類別/市場": market,
-        "最新收盤價": round(last_close, 2),
+        "市場": market,
+        "收盤價": round(last_close, 2),
         f"近{lookback_days}日報酬(%)": ret_period,
         "月線順勢勝率(%)": win_rate,
         "本益比": pe_str,
@@ -819,24 +858,21 @@ def get_single_stock_metrics(row_match, lookback_days):
 
     return table_df, pricing["summary_text"], pricing["prediction_text"]
 
-@st.dialog("📈 個股與 ETF 深度分析與行情預測", width="large")
+@st.dialog("🔍 個股深度分析與行情預測", width="large")
 def show_single_stock_analysis_modal(full_universe_df, lookback_days):
     stock_options = [f"{row['stock_id']} - {row['stock_name']} ({row['market']})" for _, row in full_universe_df.iterrows()]
     
-    col_sel, col_manual = st.columns([3, 2])
-    with col_sel:
-        selected_str = st.selectbox(
-            "🔍 下拉搜尋股票或 ETF",
-            options=stock_options,
-            index=None,
-            placeholder="請輸入代號 (如 2330、6903、0050、00878) 或名稱搜尋..."
-        )
-    with col_manual:
-        manual_code = st.text_input(
-            "⌨️ 或直接輸入代號查詢",
-            placeholder="例如: 6903、0050、00878、00989B",
-            help="若在選單未及時找到，可直接輸入代號按 Enter 立即進行深度分析"
-        ).strip().upper()
+    selected_str = st.selectbox(
+        "🔍 下拉搜尋股票或 ETF",
+        options=stock_options,
+        index=None,
+        placeholder="輸入代號 (如 2330、0050、00878) 或名稱..."
+    )
+    manual_code = st.text_input(
+        "⌨️ 或直接輸入代號查詢",
+        placeholder="例如: 2330、6903、0050、00878",
+        help="輸入後按 Enter 立即進行量化指標運算"
+    ).strip().upper()
     
     target_row = None
     if manual_code:
@@ -862,7 +898,7 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days):
         st.markdown("---")
         st.markdown(f"### 🎯 分析標的：`{target_row['stock_id']}` **{target_row['stock_name']}** ({target_row['market']})")
         
-        with st.spinner(f"正在運算 {target_row['stock_id']} {target_row['stock_name']} 的量化指標與買賣建議..."):
+        with st.spinner(f"正在運算量化指標與買賣建議..."):
             stock_table_df, summary_text, prediction_text = get_single_stock_metrics(target_row, lookback_days)
             
         st.markdown("#### 📋 1. 核心量化指標總覽")
@@ -872,239 +908,189 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days):
         st.markdown("#### 🔮 2. 後續行情預測與操作指引")
         st.warning(prediction_text)
     else:
-        st.info("👆 請於上方選單搜尋股票/ETF 名稱，或直接輸入代號（支援全上市櫃個股與所有 ETF），系統將自動啟動量化運算。")
+        st.info("👆 請於上方選單搜尋或直接輸入代號，系統將即時啟動運算。")
         
     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
     if st.button("關閉視窗", use_container_width=True):
         st.rerun()
 
 # ==========================================
-# 11. Streamlit 互動網頁主介面
+# 11. 精選推薦專屬彈跳視窗 (上方設定條件 + 下方輸出 + 換批按鈕置底)
+# ==========================================
+@st.dialog("🎯 全市場智慧選股推薦", width="large")
+def show_stock_picks_modal(full_universe_df):
+    st.markdown("#### ⚙️ 設定選股方向與等級")
+    
+    # 頂部選股條件設定區塊（緊湊整潔）
+    c_f, c_t = st.columns(2)
+    with c_f:
+        u_fund = st.checkbox("1. 基本面", value=st.session_state.get("cfg_fund", True))
+        l_fund = st.selectbox("基本面等級", ["嚴格績優", "穩健成長", "價值轉機"], index=1, disabled=not u_fund, label_visibility="collapsed")
+        
+        u_mkt = st.checkbox("3. 籌碼面", value=st.session_state.get("cfg_mkt", True))
+        l_mkt = st.selectbox("籌碼面等級", ["法人重倉連買", "法人溫和布局", "低檔承接"], index=1, disabled=not u_mkt, label_visibility="collapsed")
+        
+    with c_t:
+        u_tech = st.checkbox("2. 技術面", value=st.session_state.get("cfg_tech", True))
+        l_tech = st.selectbox("技術面等級", ["強勢突破", "多頭排列", "底部支撐反彈"], index=0, disabled=not u_tech, label_visibility="collapsed")
+        
+        u_thm = st.checkbox("4. 熱門題材", value=st.session_state.get("cfg_thm", False))
+        l_thm = st.selectbox("題材清單", ["AI 伺服器 / 先進封裝 (CoWoS)", "矽光子 CPO / 機器人自動化", "高股息績優 / 綠能重電"], index=0, disabled=not u_thm, label_visibility="collapsed")
+
+    lookback_days = st.select_slider("回測天數", options=[60, 120, 240], value=120)
+
+    # 儲存使用者設定狀態
+    st.session_state.cfg_fund = u_fund
+    st.session_state.cfg_tech = u_tech
+    st.session_state.cfg_mkt = u_mkt
+    st.session_state.cfg_thm = u_thm
+
+    curr_cfg_key = f"{u_fund}_{l_fund}_{u_tech}_{l_tech}_{u_mkt}_{l_mkt}_{u_thm}_{l_thm}_{st.session_state.theme_last_update}"
+    if st.session_state.get("last_cfg_key") != curr_cfg_key:
+        st.session_state.batch_page = 0
+        st.session_state.last_cfg_key = curr_cfg_key
+
+    st.markdown("---")
+
+    # 執行篩選與計算
+    with st.spinner("🚀 正在運算量化模型並篩選前 25 檔精選個股..."):
+        selections = {
+            "fundamental": {"enabled": u_fund, "level": l_fund},
+            "technical": {"enabled": u_tech, "level": l_tech},
+            "market": {"enabled": u_mkt, "level": l_mkt},
+            "theme": {"enabled": u_thm, "level": l_thm},
+        }
+        stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
+        ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates, selections)
+
+    batch_size = 5
+    total_batches = max(1, int(np.ceil(len(ranked_df) / batch_size)))
+    current_page = st.session_state.batch_page % total_batches
+    start_idx = current_page * batch_size
+    end_idx = start_idx + batch_size
+    current_5_df = ranked_df.iloc[start_idx:end_idx].copy()
+
+    port_nav, bm_nav, stock_bt_df, bt_metrics = run_portfolio_backtest(current_5_df, history_dict, lookback_days=lookback_days)
+
+    st.markdown(f"### 🎯 精選推薦（第 {current_page + 1} / {total_batches} 批，共 5 檔）")
+
+    # 1. 總覽數據表格
+    overview_merge = pd.merge(
+        current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
+        stock_bt_df[["代號", f"近{lookback_days}日報酬(%)", "月線順勢勝率(%)"]],
+        left_on="stock_id",
+        right_on="代號"
+    )
+    overview_table = overview_merge[[
+        "stock_id", "stock_name", "market", "close", 
+        f"近{lookback_days}日報酬(%)", "月線順勢勝率(%)", 
+        "short_buy_range", "short_target", "mid_buy_range", "mid_target"
+    ]].rename(columns={
+        "stock_id": "代號", "stock_name": "名稱", "market": "市場", "close": "收盤價",
+        "short_buy_range": "短期建議買入", "short_target": "短期目標賣出",
+        "mid_buy_range": "中長建議買入", "mid_target": "中長目標賣出"
+    })
+    st.dataframe(overview_table, use_container_width=True, hide_index=True)
+
+    # 2. 精選 5 檔詳細建議卡片
+    for rank_num, (_, row) in enumerate(current_5_df.iterrows(), start=start_idx + 1):
+        with st.container(border=True):
+            st.markdown(f"#### #{rank_num} `{row['stock_id']}` **{row['stock_name']}** ({row['market']}) ｜ 收盤：`{row['close']}` 元")
+            st.caption(f"綜合評分：`{row['final_score']:.1f}` ｜ 推薦理由：{row['recommend_reason']}")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**⚡ 短期操作 (5~20日)**")
+                st.markdown(f"• 買入：`{row['short_buy_range']}`\n• 停利：`{row['short_target']}`\n• 停損：`{row['short_stop']}`")
+            with c2:
+                st.markdown("**🧭 中長操作 (1~6個月)**")
+                st.markdown(f"• 買入：`{row['mid_buy_range']}`\n• 停利：`{row['mid_target']}`\n• 停損：`{row['mid_stop']}`")
+
+    # 3. 按鈕配置在表格與卡片下方：換另外 5 檔
+    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+    c_btn_next, c_btn_first = st.columns([3, 2])
+    with c_btn_next:
+        if st.button("🔄 不滿意，換另外 5 檔", type="primary", use_container_width=True):
+            st.session_state.batch_page = (st.session_state.batch_page + 1) % total_batches
+            st.rerun()
+    with c_btn_first:
+        if st.button("⏮️ 回到第 1 批", use_container_width=True):
+            st.session_state.batch_page = 0
+            st.rerun()
+
+    # 4. 回測資訊摺疊區
+    with st.expander("📊 查看本批 5 檔等權重回測表現", expanded=False):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("累積報酬", f"{bt_metrics['total_return']}%")
+        m2.metric("年化報酬", f"{bt_metrics['ann_return']}%")
+        m3.metric("夏普值", f"{bt_metrics['sharpe']}")
+        m4.metric("最大回撤", f"{bt_metrics['max_dd']}%")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=port_nav.index, y=port_nav.values, mode="lines", name="推薦組合", line=dict(width=3, color="#059669")))
+        fig.add_trace(go.Scatter(x=bm_nav.index, y=bm_nav.values, mode="lines", name="大盤基準", line=dict(width=2, dash="dash", color="#888888")))
+        fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10), yaxis_title="淨值", legend=dict(orientation="h", y=1.1))
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
+    if st.button("關閉精選推薦視窗", use_container_width=True):
+        st.rerun()
+
+# ==========================================
+# 12. 主畫面 (極簡清爽：標題 + 3 大按鈕 + 沉底次要資訊)
 # ==========================================
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
 if "force_refresh_cache" not in st.session_state:
     st.session_state.force_refresh_cache = False
 
-with st.sidebar:
-    st.header("⚙️ 選股方向與等級設定")
-    st.markdown("請勾選想納入的選股方向與等級（系統已內建對應量化參數）：")
-    
-    use_fund = st.checkbox("1. 基本面選股", value=True)
-    lvl_fund = st.radio(
-        "基本面條件等級",
-        ["嚴格績優", "穩健成長", "價值轉機"],
-        index=1,
-        disabled=not use_fund
-    )
-    st.divider()
-    
-    use_tech = st.checkbox("2. 技術面選股", value=True)
-    lvl_tech = st.radio(
-        "技術面條件等級",
-        ["強勢突破", "多頭排列", "底部支撐反彈"],
-        index=0,
-        disabled=not use_tech
-    )
-    st.divider()
-    
-    use_mkt = st.checkbox("3. 市場／籌碼面選股", value=True)
-    lvl_mkt = st.radio(
-        "市場籌碼條件等級",
-        ["法人重倉連買", "法人溫和布局", "低檔承接"],
-        index=1,
-        disabled=not use_mkt
-    )
-    st.divider()
-    
-    col_theme_cb, col_theme_btn = st.columns([4, 1])
-    with col_theme_cb:
-        use_theme = st.checkbox("4. 熱門題材選股", value=False)
-    with col_theme_btn:
-        if st.button("🔄", help="點擊更新最新盤後熱門題材與資金強勢股"):
-            refresh_market_themes()
-            st.toast("🔥 熱門題材資料已成功更新至最新盤後狀態！", icon="✅")
-            st.rerun()
-            
-    st.caption(f"🕒 題材最後更新：{st.session_state.theme_last_update}")
-    
-    lvl_theme = st.radio(
-        "題材類別清單",
-        ["AI 伺服器 / 先進封裝 (CoWoS)", "矽光子 CPO / 機器人自動化", "高股息績優 / 綠能重電"],
-        index=0,
-        disabled=not use_theme,
-        label_visibility="collapsed"
-    )
-    st.divider()
-    
-    lookback = st.select_slider("回測歷史天數 (交易日)", options=[60, 120, 240], value=120)
-    
-    st.divider()
-    st.subheader("💾 盤後資料狀態")
-    if os.path.exists(CACHE_PARQUET_FILE):
-        mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
-        mtime_str = mtime.strftime("%Y-%m-%d %H:%M")
-        cache_size = os.path.getsize(CACHE_PARQUET_FILE) / 1024.0
-        
-        tw_data_date = "同步中"
-        if os.path.exists(META_JSON_FILE):
-            try:
-                with open(META_JSON_FILE, "r", encoding="utf-8") as f:
-                    tw_data_date = json.load(f).get("tw_date_label", mtime.strftime("%Y-%m-%d"))
-            except Exception:
-                tw_data_date = mtime.strftime("%Y-%m-%d")
-
-        st.caption(
-            f"• **快取檔案**：`{CACHE_PARQUET_FILE}`\n"
-            f"• **資料基準日**：`{tw_data_date}`\n"
-            f"• **檔案更新時間**：`{mtime_str}`\n"
-            f"• **檔案大小**：`{cache_size:.1f} KB`"
-        )
-    else:
-        st.caption("⚪ 快取尚未建立")
-        
-    if st.button("🔄 強制重新抓取並更新快取", use_container_width=True):
-        st.session_state.force_refresh_cache = True
-        st.cache_data.clear()
-        st.rerun()
-
-current_config_key = f"{use_fund}_{lvl_fund}_{use_tech}_{lvl_tech}_{use_mkt}_{lvl_mkt}_{use_theme}_{lvl_theme}_{st.session_state.theme_last_update}"
-if st.session_state.get("last_config_key") != current_config_key:
-    st.session_state.batch_page = 0
-    st.session_state.last_config_key = current_config_key
-
-with st.spinner("🚀 正在讀取全市場資料並計算候選標的技術指標..."):
+# 背景載入數據
+with st.spinner("🚀 載入市場數據中..."):
     force_run = st.session_state.force_refresh_cache
     full_universe_df, tw_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
-        st.toast("✅ 已向官方重新同步最新盤後資料並寫入快取！")
+        st.toast("✅ 已成功同步全市場最新盤後資料！")
 
-    selections = {
-        "fundamental": {"enabled": use_fund, "level": lvl_fund},
-        "technical": {"enabled": use_tech, "level": lvl_tech},
-        "market": {"enabled": use_mkt, "level": lvl_mkt},
-        "theme": {"enabled": use_theme, "level": lvl_theme},
-    }
-    stage1_candidates = fast_filter_funnel(full_universe_df, selections, top_n=25)
-    ranked_df, history_dict = enrich_candidates_with_kline(stage1_candidates, selections)
-
-# 頂部標題與按鈕區塊
-col_h1, col_h2, col_h3 = st.columns([2.5, 0.9, 0.6])
-with col_h1:
-    st.title("🎯 智慧選股系統")
-    st.markdown("點擊左上角 **☰** 調整選股條件，一鍵取得精選 5 檔與買賣建議。")
-with col_h2:
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("📊 盤勢分析與預測", type="primary", use_container_width=True):
-        show_market_analysis_modal()
-with col_h3:
-    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-    if st.button("⚠️ 免責聲明", use_container_width=True):
-        show_legal_disclaimer_modal()
-
-# 個股分析按鈕
-st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
-col_stock_btn_1, col_stock_btn_2, col_stock_btn_3 = st.columns([1, 4, 1])
-with col_stock_btn_2:
-    if st.button("📈 查詢與分析指定個股 / ETF（個股分析）", key="btn_single_stock_analysis", use_container_width=True):
-        show_single_stock_analysis_modal(full_universe_df, lookback)
-st.markdown("<div style='height: 5px;'></div>", unsafe_allow_html=True)
-
-batch_size = 5
-total_batches = max(1, int(np.ceil(len(ranked_df) / batch_size)))
-current_page = st.session_state.batch_page % total_batches
-start_idx = current_page * batch_size
-end_idx = start_idx + batch_size
-current_5_df = ranked_df.iloc[start_idx:end_idx].copy()
-
-port_nav, bm_nav, stock_bt_df, bt_metrics = run_portfolio_backtest(current_5_df, history_dict, lookback_days=lookback)
-
-col_title, col_btn1, col_btn2 = st.columns([3, 1, 1])
-with col_title:
-    st.subheader(f"🎯 全市場精選推薦（第 {current_page + 1} / {total_batches} 批，共推薦 {len(current_5_df)} 檔）")
-with col_btn1:
-    if st.button("🔄 不滿意，換另外 5 檔", type="primary", use_container_width=True):
-        st.session_state.batch_page = (st.session_state.batch_page + 1) % total_batches
-        st.rerun()
-with col_btn2:
-    if st.button("⏮️ 回到第一批 Top 5", use_container_width=True):
-        st.session_state.batch_page = 0
-        st.rerun()
-
-# 置頂總覽表格
-overview_merge = pd.merge(
-    current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
-    stock_bt_df[["代號", f"近{lookback}日報酬(%)", "月線順勢勝率(%)"]],
-    left_on="stock_id",
-    right_on="代號"
-)
-overview_table = overview_merge[[
-    "stock_id", "stock_name", "market", "close", 
-    f"近{lookback}日報酬(%)", "月線順勢勝率(%)", 
-    "short_buy_range", "short_target", "mid_buy_range", "mid_target"
-]].rename(columns={
-    "stock_id": "代號",
-    "stock_name": "名稱",
-    "market": "市場",
-    "close": "最新收盤價",
-    "short_buy_range": "短期建議買入",
-    "short_target": "短期目標賣出",
-    "mid_buy_range": "中長建議買入",
-    "mid_target": "中長目標賣出"
-})
-
-st.markdown(f"##### 📋 精選 5 檔數據總覽（含近 {lookback} 日區間報酬、勝率與買賣建議價格）")
-st.dataframe(overview_table, use_container_width=True, hide_index=True)
-
-for rank_num, (_, row) in enumerate(current_5_df.iterrows(), start=start_idx + 1):
-    with st.container(border=True):
-        c1, c2, c3 = st.columns([2.2, 2.5, 2.5])
-        with c1:
-            st.markdown(f"### #{rank_num} `{row['stock_id']}` {row['stock_name']} ({row['market']})")
-            st.markdown(f"**最新收盤價：`{row['close']}` 元** ｜ 綜合評分：`{row['final_score']:.1f}`")
-            st.info(f"💡 **推薦理由**：{row['recommend_reason']}")
-        with c2:
-            st.markdown("**⚡ 短期操作建議 (5~20日，依 MA5 & ATR 計算)**")
-            st.markdown(f"- 🟢 **建議買入區間**：`{row['short_buy_range']}` 元")
-            st.markdown(f"- 🎯 **目標停利賣出**：`{row['short_target']}` 元")
-            st.markdown(f"- 🛡️ **防守停損價位**：`{row['short_stop']}` 元")
-        with c3:
-            st.markdown("**🧭 中長期操作建議 (1~6個月，依月季線計算)**")
-            st.markdown(f"- 🟢 **建議買入區間**：`{row['mid_buy_range']}` 元")
-            st.markdown(f"- 🎯 **目標停利賣出**：`{row['mid_target']}` 元")
-            st.markdown(f"- 🛡️ **防守停損價位**：`{row['mid_stop']}` 元")
-
+# 1. 簡潔頂部標題
 st.markdown("""
-<div class="disclaimer-banner">
-    <strong>⚖️ 投資風險與合規警語：</strong><br>
-    本系統所有選股結果、策略回測數值與價格區間僅供量化研究與演算法教學展示，不構成任何證券之要約或投資買賣建議。過往績效不保證未來獲利，投資人應獨立判斷並自負交易盈虧責任。
+<div class="mobile-header">
+    <h1>智慧選股</h1>
 </div>
 """, unsafe_allow_html=True)
 
-st.divider()
-tab_bt, tab_detail = st.tabs([
-    "📊 推薦組合淨值曲線與風險指標", 
-    "📋 完整量化指標明細表"
-])
+# 2. 主畫面三大主要功能按鈕 (大圖示、大字體、高觸控面積)
+col_nav1, col_nav2, col_nav3 = st.columns([1, 8, 1])
+with col_nav2:
+    # 功能按鈕 1：盤勢分析
+    if st.button("📊 盤勢分析", key="btn_nav_market", use_container_width=True):
+        show_market_analysis_modal()
 
-with tab_bt:
-    st.markdown(f"#### 等權重持有當前推薦 5 檔股票 — 近 `{lookback}` 個交易日組合表現")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("區間累積報酬率", f"{bt_metrics['total_return']}%", f"{bt_metrics['total_return'] - (bm_nav.iloc[-1]-100):.2f}% vs 大盤")
-    m2.metric("年化報酬率 (CAGR)", f"{bt_metrics['ann_return']}%")
-    m3.metric("年化夏普值 (Sharpe)", f"{bt_metrics['sharpe']}")
-    m4.metric("最大回撤 (MDD)", f"{bt_metrics['max_dd']}%")
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=port_nav.index, y=port_nav.values, mode="lines", name="推薦 5 檔等權重組合 (基準=100)", line=dict(width=3, color="#1a73e8")))
-    fig.add_trace(go.Scatter(x=bm_nav.index, y=bm_nav.values, mode="lines", name="台股大盤基準 (基準=100)", line=dict(width=2, dash="dash", color="#888888")))
-    fig.update_layout(height=380, margin=dict(l=20, r=20, t=30, b=20), yaxis_title="組合淨值", legend=dict(orientation="h", y=1.1))
-    st.plotly_chart(fig, use_container_width=True)
+    # 功能按鈕 2：個股分析
+    if st.button("🔍 個股分析", key="btn_nav_stock", use_container_width=True):
+        show_single_stock_analysis_modal(full_universe_df, lookback_days=120)
 
-with tab_detail:
-    display_cols = [
-        "stock_id", "stock_name", "market", "close", "pe_ratio", "dividend_yield", 
-        "rsi_14", "vol_ratio", "short_buy_range", "short_target", "mid_buy_range", "mid_target"
-    ]
-    st.dataframe(current_5_df[display_cols], use_container_width=True, hide_index=True)
+    # 功能按鈕 3：精選推薦
+    if st.button("🎯 精選推薦", key="btn_nav_picks", use_container_width=True):
+        show_stock_picks_modal(full_universe_df)
+
+# 3. 沉底放置的次要功能與狀態 (免責說明、題材更新、快取狀態)
+st.markdown("<div style='height: 40px;'></div>", unsafe_allow_html=True)
+st.markdown('<div class="footer-bar">', unsafe_allow_html=True)
+
+c_sub1, c_sub2, c_sub3 = st.columns(3)
+with c_sub1:
+    if st.button("⚠️ 免責聲明", use_container_width=True):
+        show_legal_disclaimer_modal()
+with c_sub2:
+    if st.button("🔄 更新題材", help="重新載入最新熱門題材概念名單", use_container_width=True):
+        refresh_market_themes()
+        st.toast("🔥 熱門題材資料已更新！", icon="✅")
+        st.rerun()
+with c_sub3:
+    if st.button("💾 同步數據", help="強制重新抓取證交所與櫃買中心數據並覆蓋快取", use_container_width=True):
+        st.session_state.force_refresh_cache = True
+        st.cache_data.clear()
+        st.rerun()
+
+# 顯示最後更新簡要文字
+st.caption(f"資料基準日：`{tw_trading_date}` ｜ 題材更新：`{st.session_state.theme_last_update}`")
+st.markdown('</div>', unsafe_allow_html=True)
