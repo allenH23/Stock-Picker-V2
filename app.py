@@ -41,7 +41,7 @@ st.markdown("""
         text-shadow: 0 4px 15px rgba(37, 99, 235, 0.15);
     }
     
-    /* 2. 並排次要按鈕（盤勢分析、個股分析）：文字放大至 1.45rem */
+    /* 2. 並排次要按鈕（盤勢分析、個股分析）：文字 1.45rem */
     div.st-key-btn_nav_market button,
     div.st-key-btn_nav_stock button {
         height: 75px !important;
@@ -67,7 +67,7 @@ st.markdown("""
     div.st-key-btn_nav_market button p, div.st-key-btn_nav_market button span,
     div.st-key-btn_nav_stock button p, div.st-key-btn_nav_stock button span {
         color: #ffffff !important;
-        font-size: 1.45rem !important; /* 顯著加大 */
+        font-size: 1.45rem !important;
         font-weight: 800 !important;
         letter-spacing: 1px !important;
     }
@@ -110,7 +110,7 @@ st.markdown("""
         padding: 4px !important;
     }
 
-    /* 5. 強化加大加粗選股方向文字 (1. 基本面、2. 技術面、3. 籌碼面、4. 熱門題材) */
+    /* 5. 強化加大加粗選股方向文字 */
     div.factor-title label p {
         font-size: 1.4rem !important;
         font-weight: 900 !important;
@@ -229,16 +229,18 @@ def parse_tw_roc_date(roc_date_str: str) -> str:
     return f"{tw_now.strftime('%Y-%m-%d')} ({weekday_map.get(tw_now.weekday(), '')})"
 
 # ==========================================
-# 2. 全市場真實數據擷取與 Parquet 磁碟快取
+# 2. 全市場真實數據擷取（強化防快取與即時更新）
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
+    # 若不是強制更新且快取檔案存在未逾期，直接讀取快取
     if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
             with open(META_JSON_FILE, "r", encoding="utf-8") as f:
                 meta_info = json.load(f)
             cached_label = meta_info.get("tw_date_label", "")
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
-            if (datetime.now() - mtime).total_seconds() < 43200 and cached_label:
+            # 檔案小於 4 小時且有內容則使用快取
+            if (datetime.now() - mtime).total_seconds() < 14400 and cached_label:
                 df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
                 if not df_cached.empty and len(df_cached) >= 1000 and df_cached["stock_id"].str.startswith("00").any():
                     df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
@@ -246,13 +248,19 @@ def fetch_full_market_universe(force_refresh: bool = False):
         except Exception:
             pass
 
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # 強制向 API 發送防快取 HTTP 標頭
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+    }
     market_rows = []
     twse_raw_date_str = ""
 
     pe_twse = {}
     try:
-        r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=8)
+        r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=10)
         if r_pe.status_code == 200:
             for row in r_pe.json():
                 code = str(row.get("Code", "")).strip()
@@ -269,7 +277,7 @@ def fetch_full_market_universe(force_refresh: bool = False):
         pass
 
     try:
-        r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=8)
+        r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=10)
         if r_p.status_code == 200:
             for row in r_p.json():
                 code = str(row.get("Code", "")).strip()
@@ -301,8 +309,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
         pass
 
     try:
-        r_otc_pe = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=headers, timeout=8)
-        r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=8)
+        r_otc_pe = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", headers=headers, timeout=10)
+        r_otc = requests.get("https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes", headers=headers, timeout=10)
         
         pe_otc = {}
         if r_otc_pe.status_code == 200:
@@ -482,7 +490,7 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
     }
 
 # ==========================================
-# 5. 獨立 K 線歷史資料記憶體快取模組 (快取 4 小時)
+# 5. 獨立 K 線歷史資料記憶體快取模組
 # ==========================================
 @st.cache_data(ttl=14400, show_spinner=False)
 def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
@@ -584,7 +592,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         hist_df["MA60"] = ma60
         history_dict[sid] = hist_df
         
-        # 1. 技術面特化加權
         tech_score = 0.0
         tech_hit = False
         if selections["technical"]["enabled"]:
@@ -613,7 +620,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
 
         base_combined_score = row["stage1_score"] + tech_score
 
-        # 2. 自適應動態共振判定
         hit_count = 0
         if "fund" in active_factors:
             hit_count += int(row["stage1_score"] >= 25.0)
@@ -638,7 +644,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
 
         scaled_score = base_combined_score * multiplier
 
-        # 3. 破壞性扣分項
         penalties = 0.0
         bias_ma20 = (last_close - last_ma20) / last_ma20 if last_ma20 > 0 else 0.0
         if bias_ma20 > 0.15:
@@ -779,7 +784,7 @@ def generate_dynamic_analysis_texts(market_data: dict):
         tomorrow_pred = (
             f"🛡️ **【情境：恐慌重挫修正】➔ 操作方向：『現金為王，嚴控部位防破線』**\n\n"
             f"* **量化訊號**：隔夜費半指數重挫 `{sox_pct:+.2f}%`、那斯達克變動 `{nasdaq_pct:+.2f}%`，國際系統性賣壓升高。\n"
-            f"* **具體指引**：早盤台股電子股恐面臨連鎖回測壓力。**極度建議保持空手或將持股水位降至 3 成以下**，嚴禁向下攤平或躁進接刀，耐心等待恐慌賣壓宣洩。"
+            f"* **具指引**：早盤台股電子股恐面臨連鎖回測壓力。**極度建議保持空手或將持股水位降至 3 成以下**，嚴禁向下攤平或躁進接刀，耐心等待恐慌賣壓宣洩。"
         )
     elif sox_pct < -0.8 or nasdaq_pct < -0.8:
         tomorrow_pred = (
@@ -983,7 +988,7 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days):
         st.rerun()
 
 # ==========================================
-# 11. 精選推薦專屬彈跳視窗 (嚴格順序 1->2->3->4 與熱門題材垂直排列)
+# 11. 精選推薦專屬彈跳視窗（維持開啟防跳出修復）
 # ==========================================
 @st.dialog("🎯 全市場智慧選股推薦", width="large")
 def show_stock_picks_modal(full_universe_df):
@@ -1031,7 +1036,7 @@ def show_stock_picks_modal(full_universe_df):
     if not l_mkt: l_mkt = "法人溫和布局"
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    # 嚴格順序：4. 熱門題材 (改為垂直直向排列，全螢幕不裁切)
+    # 嚴格順序：4. 熱門題材 (垂直直向排列)
     st.markdown('<div class="factor-title">', unsafe_allow_html=True)
     u_thm = st.checkbox("4. 熱門題材", value=st.session_state.get("cfg_thm", False))
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1070,7 +1075,7 @@ def show_stock_picks_modal(full_universe_df):
 
     st.markdown("---")
 
-    # 局部運算提示
+    # 局部運算
     with st.spinner("🚀 正在運算量化模型並篩選前 25 檔精選個股..."):
         selections = {
             "fundamental": {"enabled": u_fund, "level": l_fund},
@@ -1111,20 +1116,22 @@ def show_stock_picks_modal(full_universe_df):
     })
     st.dataframe(overview_table, use_container_width=True, hide_index=True)
 
-    # 2. 按鈕夾心位置：夾在「5 檔個股表格」與「各股推薦說明」中間
+    # 2. 按鈕夾心位置：換一批（保持彈窗開啟狀態）
     st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
     c_btn_next, c_btn_first = st.columns([3, 2])
     with c_btn_next:
         if st.button("🔄 不滿意，換一批", type="primary", use_container_width=True):
             st.session_state.batch_page = (st.session_state.batch_page + 1) % total_batches
+            st.session_state.show_picks_modal = True  # 確保 rerun 後自動再次開啟彈窗
             st.rerun()
     with c_btn_first:
         if st.button("⏮️ 回到第 1 批", use_container_width=True):
             st.session_state.batch_page = 0
+            st.session_state.show_picks_modal = True  # 確保 rerun 後自動再次開啟彈窗
             st.rerun()
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    # 3. 精選 5 檔詳細建議卡片（評分與理由加藍底飾板）
+    # 3. 精選 5 檔詳細建議卡片
     for rank_num, (_, row) in enumerate(current_5_df.iterrows(), start=start_idx + 1):
         with st.container(border=True):
             st.markdown(f"#### #{rank_num} `{row['stock_id']}` **{row['stock_name']}** ({row['market']}) ｜ 收盤：`{row['close']}` 元")
@@ -1144,11 +1151,12 @@ def show_stock_picks_modal(full_universe_df):
                 st.markdown("**🧭 中長操作 (1~6個月)**")
                 st.markdown(f"• 買入：`{row['mid_buy_range']}`\n• 停利：`{row['mid_target']}`\n• 停損：`{row['mid_stop']}`")
 
-    # 4. 回測資訊摺疊區（包含天數滑桿）
+    # 4. 回測資訊摺疊區
     with st.expander("📊 查看本批 5 檔回測表現", expanded=False):
         new_lookback = st.select_slider("回測歷史天數 (交易日)", options=[60, 120, 240], value=active_lookback)
         if new_lookback != active_lookback:
             st.session_state.user_lookback_days = new_lookback
+            st.session_state.show_picks_modal = True
             st.rerun()
 
         m1, m2, m3, m4 = st.columns(4)
@@ -1164,22 +1172,40 @@ def show_stock_picks_modal(full_universe_df):
 
     st.markdown("<div style='height: 15px;'></div>", unsafe_allow_html=True)
     if st.button("關閉精選推薦視窗", use_container_width=True):
+        st.session_state.show_picks_modal = False
         st.rerun()
 
 # ==========================================
-# 12. 主畫面 (大字體標題 + 1:1:2 比例大字體按鈕 + 沉底次要資訊)
+# 12. 主畫面
 # ==========================================
 if "batch_page" not in st.session_state:
     st.session_state.batch_page = 0
 if "force_refresh_cache" not in st.session_state:
     st.session_state.force_refresh_cache = False
+if "show_picks_modal" not in st.session_state:
+    st.session_state.show_picks_modal = False
 
+# 背景載入數據
 with st.spinner("🚀 載入市場數據中..."):
     force_run = st.session_state.force_refresh_cache
+    if force_run:
+        # 強制實體刪除快取檔，確保重新拉取官方最新資料
+        if os.path.exists(CACHE_PARQUET_FILE):
+            try: os.remove(CACHE_PARQUET_FILE)
+            except Exception: pass
+        if os.path.exists(META_JSON_FILE):
+            try: os.remove(META_JSON_FILE)
+            except Exception: pass
+        st.cache_data.clear()
+
     full_universe_df, tw_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
-        st.toast("✅ 已成功同步全市場最新盤後資料！")
+        st.toast("✅ 已強制向證交所同步最新盤後資料！")
+
+# 若處於「精選推薦」開啟狀態（例如點了換一批後 rerun），自動呼叫彈窗
+if st.session_state.show_picks_modal:
+    show_stock_picks_modal(full_universe_df)
 
 # 1. 藝術感大字體標題
 st.markdown("""
@@ -1188,10 +1214,9 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# 2. 面積比例 1 : 1 : 2 的三顆主要功能按鈕 (字體加大)
+# 2. 面積比例 1 : 1 : 2 的三顆主要功能按鈕
 col_main_wrap_1, col_main_wrap_2, col_main_wrap_3 = st.columns([0.5, 9, 0.5])
 with col_main_wrap_2:
-    # 上方並排兩顆面積各為 1 的精緻按鈕 (高 75px，字體 1.45rem)
     col_sq1, col_sq2 = st.columns(2)
     with col_sq1:
         if st.button("📊 盤勢分析", key="btn_nav_market", use_container_width=True):
@@ -1200,11 +1225,12 @@ with col_main_wrap_2:
         if st.button("🔍 個股分析", key="btn_nav_stock", use_container_width=True):
             show_single_stock_analysis_modal(full_universe_df, lookback_days=120)
 
-    # 下方核心功能按鈕：面積為 2 (兩倍大，高 144px，字體 1.7rem)
+    # 點選精選推薦，設置標記並開啟
     if st.button("🎯 精選推薦個股", key="btn_nav_picks", use_container_width=True):
+        st.session_state.show_picks_modal = True
         show_stock_picks_modal(full_universe_df)
 
-# 3. 沉底放置的次要功能與狀態 (免責說明、題材更新、快取狀態)
+# 3. 沉底次要功能列
 st.markdown("<div style='height: 35px;'></div>", unsafe_allow_html=True)
 st.markdown('<div class="footer-bar">', unsafe_allow_html=True)
 
@@ -1220,7 +1246,6 @@ with c_sub2:
 with c_sub3:
     if st.button("💾 同步數據", help="強制重新抓取證交所與櫃買中心數據並覆蓋快取", use_container_width=True):
         st.session_state.force_refresh_cache = True
-        st.cache_data.clear()
         st.rerun()
 
 st.caption(f"資料基準日：`{tw_trading_date}` ｜ 題材更新：`{st.session_state.theme_last_update}`")
