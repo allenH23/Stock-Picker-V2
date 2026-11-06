@@ -232,14 +232,12 @@ def parse_tw_roc_date(roc_date_str: str) -> str:
 # 2. 全市場真實數據擷取（強化防快取與即時更新）
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
-    # 若不是強制更新且快取檔案存在未逾期，直接讀取快取
     if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
             with open(META_JSON_FILE, "r", encoding="utf-8") as f:
                 meta_info = json.load(f)
             cached_label = meta_info.get("tw_date_label", "")
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
-            # 檔案小於 4 小時且有內容則使用快取
             if (datetime.now() - mtime).total_seconds() < 14400 and cached_label:
                 df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
                 if not df_cached.empty and len(df_cached) >= 1000 and df_cached["stock_id"].str.startswith("00").any():
@@ -248,7 +246,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
         except Exception:
             pass
 
-    # 強制向 API 發送防快取 HTTP 標頭
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -422,13 +419,14 @@ def fast_filter_funnel(full_df: pd.DataFrame, selections: dict, top_n: int = 25)
     return ranked_pool
 
 # ==========================================
-# 4. 狀態聯動動態定價模型
+# 4. 個股狀態聯動動態定價與 6 大細分情境指引
 # ==========================================
-def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr):
-    is_bull = (last_close >= last_ma20) and (last_rsi >= 50)
-    is_bear = (last_close < last_ma20) and (last_rsi < 48)
+def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60, last_rsi, last_atr, vol_ratio, is_high_10d):
+    bias_ma20 = (last_close - last_ma20) / last_ma20 if last_ma20 > 0 else 0.0
+    ma60_slope_down = (last_ma60 < prev_ma60)
 
-    if is_bull:
+    # 1. 買賣建議區間基準計算
+    if last_close >= last_ma20 and last_rsi >= 50:
         short_buy_low = round(min(last_ma5 - 0.2 * last_atr, last_close - 0.4 * last_atr), 2)
         short_buy_high = round(min(last_close, max(last_ma5, last_close - 0.1 * last_atr)), 2)
         if short_buy_low >= short_buy_high:
@@ -442,11 +440,7 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         mid_buy_range = f"{mid_buy_low} ~ {mid_buy_high}"
         mid_target = round(last_close + 4.5 * last_atr, 2)
         mid_stop = round(last_ma60 * 0.97, 2)
-
-        summary_text = f"價位站穩月線之上呈多頭排列，RSI 動能達 {last_rsi:.1f}，均線支撐力道強韌，價量配合良好。"
-        prediction_text = "**【宜買 / 逢回分批承接】** 多頭趨勢結構紮實，建議待價格小幅回測五日線或月線支撐不破時，採逢回分批承接策略。"
-
-    elif is_bear:
+    elif last_close < last_ma20 and last_rsi < 48:
         short_buy_low = round(last_close - 1.8 * last_atr, 2)
         short_buy_high = round(last_close - 1.0 * last_atr, 2)
         short_buy_range = f"{short_buy_low} ~ {short_buy_high} (測撐區)"
@@ -458,10 +452,6 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         mid_buy_range = f"{mid_buy_low} ~ {mid_buy_high} (長線觀察)"
         mid_target = round(last_close + 3.0 * last_atr, 2)
         mid_stop = round(last_close - 2.8 * last_atr, 2)
-
-        summary_text = f"近日承壓修正，價格跌破關鍵月線且 RSI 偏弱（{last_rsi:.1f}），短線結構進入整理或測撐階段。"
-        prediction_text = "**【宜觀望 / 勿急於接刀】** 目前面臨修正壓力，現價追入風險較高。建議保持觀望，耐心等待標的回測下方預估測撐區並出現止穩訊號再行評估。"
-
     else:
         short_buy_low = round(last_ma20 - 1.0 * last_atr, 2)
         short_buy_high = round(last_ma20 - 0.3 * last_atr, 2)
@@ -475,8 +465,25 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi,
         mid_target = round(last_close + 3.5 * last_atr, 2)
         mid_stop = round(last_ma60 * 0.97, 2)
 
-        summary_text = f"於月線附近區間震盪（RSI {last_rsi:.1f}），多空力量在此交戰拉鋸，成交量能溫和，等待方向突破。"
-        prediction_text = "**【區間操作 / 保持彈性】** 目前處於箱型整理格局，方向尚未單邊明朗。切勿追高現價，建議在建議買入區間（箱型下緣）低接、接近目標價時獲利調節。"
+    # 2. 個股後續行情預測與操作指引（細分為 6 種情境）
+    if ma60_slope_down and last_close < last_ma60:
+        summary_text = f"股價跌破季線（{last_ma60:.1f}）且季線呈現下彎蓋頭壓制，中長線架構偏空，下檔支撐待測。"
+        prediction_text = "🛡️ **【情境：破線走空】➔ 操作指引：『嚴控風險，持股應停損換股或空手避開』**\n\n* **結構分析**：中長期趨勢轉空，上方均線形成沉重套牢賣壓。\n* **操作指引**：反彈皆為減碼點，切勿逢低加碼或攤平，待中長線打出底部結構再重新評估。"
+    elif bias_ma20 > 0.15 or (is_high_10d and vol_ratio < 0.70):
+        summary_text = f"短線正乖離過大（月線乖離 {bias_ma20*100:+.1f}%）或出現高檔量價背離，短線追高動能衰退。"
+        prediction_text = "🔄 **【情境：高檔過熱】➔ 操作指引：『切勿追高，短線逢高分批獲利調節』**\n\n* **結構分析**：指標處於高檔超買區，隨時有技術性乖離修正或獲利了結賣壓。\n* **操作指引**：手中持股建議逢高分批停利，未持有者耐心等待回測月線或 5 日線止穩再行承接。"
+    elif last_close >= last_ma5 and last_ma5 >= last_ma20 and last_rsi >= 58 and vol_ratio >= 1.3:
+        summary_text = f"均線呈現典型多頭向上發散，放量突破短期整理區，RSI 動能達 {last_rsi:.1f}，多方強勢主導。"
+        prediction_text = "🚀 **【情境：強多突破】➔ 操作指引：『順勢偏多操作，緊盯主流攻擊動能』**\n\n* **結構分析**：價量齊揚站上所有短期均線，波段攻擊訊號強烈。\n* **操作指引**：可於開盤量能持續放大時順勢進場或加碼，防守點設定於 5 日線或突破點邊緣。"
+    elif last_close >= last_ma20 and last_rsi >= 50:
+        summary_text = f"股價穩健站於月線與短期均線之上，結構維持偏多排列，回測均線支撐力道良好。"
+        prediction_text = "🟢 **【情境：穩健多頭】➔ 操作指引：『逢回分批承接，沿短均線佈局』**\n\n* **結構分析**：中期趨勢向上，籌碼安定度高，尚未出現過熱失控跡象。\n* **操作指引**：不追高現價，建議在建議買入區間（回測 5 日線至月線）採分批掛單承接策略。"
+    elif last_close < last_ma20 or last_rsi < 45:
+        summary_text = f"近日承壓修正，跌破關鍵月線支撐且 RSI 偏弱（{last_rsi:.1f}），短線結構進入測撐整理。"
+        prediction_text = "⚠️ **【情境：弱勢整理】➔ 操作指引：『高度觀望，靜待下檔測撐止穩訊號』**\n\n* **結構分析**：短線多頭力道暫歇，空方佔據優勢，價格有進一步尋求下檔支撐之虞。\n* **操作指引**：暫停買進動作，耐心等待標的回測下方預估測撐區並出現止跌打底紅 K 再行評估。"
+    else:
+        summary_text = f"於月線附近區間震盪（RSI {last_rsi:.1f}），多空雙方力量在此拉鋸膠著，成交量能溫和。"
+        prediction_text = "⚖️ **【情境：箱型震盪】➔ 操作指引：『區間來回操作，保持資金彈性』**\n\n* **結構分析**：處於箱型整理中軸，尚未出現明確的方向性突破。\n* **操作指引**：切勿追買，建議在建議買入區間（箱型下緣）逢低承接、接近目標價時適度獲利調節。"
 
     return {
         "short_buy_range": short_buy_range,
@@ -586,7 +593,10 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         vol_ratio = float(v.iloc[-1] / avg_v_5d)
         ret_5d = float((c.iloc[-1] / c.iloc[-6] - 1) * 100) if len(c) >= 6 else 0.0
         
-        pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
+        highest_10d = float(c.iloc[-10:].max()) if len(c) >= 10 else last_close
+        is_high_10d = bool(last_close >= highest_10d * 0.99)
+
+        pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60, last_rsi, last_atr, vol_ratio, is_high_10d)
         
         hist_df["MA20"] = ma20
         hist_df["MA60"] = ma60
@@ -649,8 +659,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
         if bias_ma20 > 0.15:
             penalties += 25.0
             
-        highest_10d = float(c.iloc[-10:].max()) if len(c) >= 10 else last_close
-        if last_close >= highest_10d * 0.99 and vol_ratio < 0.70:
+        if is_high_10d and vol_ratio < 0.70:
             penalties += 20.0
 
         ma60_slope_down = (last_ma60 < prev_ma60)
@@ -784,37 +793,37 @@ def generate_dynamic_analysis_texts(market_data: dict):
         tomorrow_pred = (
             f"🛡️ **【情境：恐慌重挫修正】➔ 操作方向：『現金為王，嚴控部位防破線』**\n\n"
             f"* **量化訊號**：隔夜費半指數重挫 `{sox_pct:+.2f}%`、那斯達克變動 `{nasdaq_pct:+.2f}%`，國際系統性賣壓升高。\n"
-            f"* **具指引**：早盤台股電子股恐面臨連鎖回測壓力。**極度建議保持空手或將持股水位降至 3 成以下**，嚴禁向下攤平或躁進接刀，耐心等待恐慌賣壓宣洩。"
+            f"* **明日操作建議**：早盤台股電子股恐面臨連鎖回測壓力。**極度建議保持空手或將持股水位降至 3 成以下**，嚴禁向下攤平或躁進接刀，耐心等待恐慌賣壓宣洩。"
         )
     elif sox_pct < -0.8 or nasdaq_pct < -0.8:
         tomorrow_pred = (
             f"⚠️ **【情境：外盤承壓震盪】➔ 操作方向：『高度觀望，靜待下檔止穩訊號』**\n\n"
             f"* **量化訊號**：美股科技板塊走弱（費半 `{sox_pct:+.2f}%`），供應鏈受壓。\n"
-            f"* **具體指引**：指數短線恐有回測 5 日線或月線支撐之虞。現階段**建議暫採觀望**，若手中持股跌破關鍵短均線應落實停損，切勿隨意追逐開盤反彈。"
+            f"* **明日操作建議**：指數短線恐有回測 5 日線或月線支撐之虞。現階段**建議暫採觀望**，若手中持股跌破關鍵短均線應落實停損，切勿隨意追逐開盤反彈。"
         )
     elif tw_pct > 1.0 and (sox_pct < -0.2 or nasdaq_pct < -0.2):
         tomorrow_pred = (
             f"🔄 **【情境：高檔背離輪動】➔ 操作方向：『嚴防追高風險，短線逢高獲利調節』**\n\n"
             f"* **量化訊號**：台股今日雖強（`{tw_pct:+.2f}%`），但美股科技股並未同步跟進（費半 `{sox_pct:+.2f}%`），出現步調分歧。\n"
-            f"* **具體指引**：明日早盤若開高容易引發隔日沖或短線獲利了結賣壓。**不宜追買正乖離已大之熱門股**，建議逢高分批調節獲利，拉回至月線附近再行審視。"
+            f"* **明日操作建議**：明日早盤若開高容易引發隔日沖或短線獲利了結賣壓。**不宜追買正乖離已大之熱門股**，建議逢高分批調節獲利，拉回至月線附近再行審視。"
         )
     elif abs(sox_pct) <= 0.8 and abs(tw_pct) <= 0.8:
         tomorrow_pred = (
             f"⚖️ **【情境：多空均衡整理】➔ 操作方向：『區間來回操作，鎖定具基本面支撐標的』**\n\n"
             f"* **量化訊號**：國際指數窄幅波動（費半 `{sox_pct:+.2f}%`），大盤方向尚未明朗。\n"
-            f"* **具體指引**：大盤空間有限，但具備個股表現機會。操作宜**『買黑不買紅』**，在支撐區（月線下緣）逢低承接、接近壓力區時適度獲利落袋。"
+            f"* **明日操作建議**：大盤空間有限，但具備個股表現機會。操作宜**『買黑不買紅』**，在支撐區（月線下緣）逢低承接、接近壓力區時適度獲利落袋。"
         )
     elif sox_pct > 1.8 and nasdaq_pct > 1.2:
         tomorrow_pred = (
             f"🚀 **【情境：強大多方共振】➔ 操作方向：『積極偏多操作，緊盯主流強勢領頭羊』**\n\n"
             f"* **量化訊號**：隔夜費半大漲 `{sox_pct:+.2f}%`，國際科技風險偏好爆發，外資熱錢回流可期。\n"
-            f"* **具體指引**：明日早盤有望跳空開高。建議順應強多趨勢，**聚焦符合『三因子共振』之高評分主流領漲標的**，開盤後若量能持續放大可順勢偏多佈局。"
+            f"* **明日操作建議**：明日早盤有望跳空開高。建議順應強多趨勢，**聚焦符合『三因子共振』之高評分主流領漲標的**，開盤後若量能持續放大可順勢偏多佈局。"
         )
     else:
         tomorrow_pred = (
             f"🟢 **【情境：溫和震盪趨堅】➔ 操作方向：『逢回分批承接，沿短均線偏多布局』**\n\n"
             f"* **量化訊號**：美股維持穩健（費半 `{sox_pct:+.2f}%`），台股多頭架構未變。\n"
-            f"* **具體指引**：指數結構偏多但非全面暴衝，盤面採良性類股輪動。操作建議**逢回檔至 5 日線或支撐區時分批佈局**，持股續抱多頭排列個股。"
+            f"* **明日操作建議**：指數結構偏多但非全面暴衝，盤面採良性類股輪動。操作建議**逢回檔至 5 日線或支撐區時分批佈局**，持股續抱多頭排列個股。"
         )
 
     return today_summary, tomorrow_pred
@@ -852,7 +861,7 @@ def show_market_analysis_modal():
         st.rerun()
 
 # ==========================================
-# 10. 個股深度分析彈跳視窗
+# 10. 個股深度分析彈跳視窗（含綜合評分與 6 大情境預測）
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
     sid = str(row_match["stock_id"])
@@ -878,6 +887,7 @@ def get_single_stock_metrics(row_match, lookback_days):
     c = hist_df["Close"]
     h = hist_df["High"]
     l = hist_df["Low"]
+    v = hist_df["Volume"]
     
     ma5 = c.rolling(5).mean()
     ma20 = c.rolling(20).mean()
@@ -896,8 +906,15 @@ def get_single_stock_metrics(row_match, lookback_days):
     last_ma5 = float(ma5.iloc[-1])
     last_ma20 = float(ma20.iloc[-1])
     last_ma60 = float(ma60.iloc[-1])
+    prev_ma60 = float(ma60.iloc[-6]) if len(ma60) >= 6 else last_ma60
     last_rsi = float(rsi14.iloc[-1])
     last_atr = float(atr14.iloc[-1])
+    
+    avg_v_5d = max(float(v.iloc[-6:-1].mean()), 1.0)
+    vol_ratio = float(v.iloc[-1] / avg_v_5d)
+    
+    highest_10d = float(c.iloc[-10:].max()) if len(c) >= 10 else last_close
+    is_high_10d = bool(last_close >= highest_10d * 0.99)
     
     lookback_idx = min(lookback_days, len(c) - 1)
     past_close = float(c.iloc[-lookback_idx])
@@ -909,7 +926,40 @@ def get_single_stock_metrics(row_match, lookback_days):
     active_days = hist_df[hist_df["signal"] == 1]
     win_rate = round((active_days["strat_ret"] > 0).mean() * 100, 1) if len(active_days) > 0 else 50.0
     
-    pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, last_rsi, last_atr)
+    # ----------------------------------------------------
+    # 計算同款量化綜合評分 (使個股分析與精選選股口徑一致)
+    # ----------------------------------------------------
+    # 1. 基本面基底分 (20~40分)
+    pe_val = float(row_match.get("pe_ratio", 22.0)) if pd.notnull(row_match.get("pe_ratio")) else 22.0
+    dy_val = float(row_match.get("dividend_yield", 2.5)) if pd.notnull(row_match.get("dividend_yield")) else 2.5
+    fund_base = 35.0 if (pe_val <= 25 and dy_val >= 2.0) else 20.0
+    fund_base += (dy_val * 2.0) - (pe_val * 0.3)
+    
+    # 2. 技術面基底分
+    tech_base = (last_rsi * 0.3) + (25.0 if last_close >= last_ma20 else 0.0) + (15.0 if (last_close >= last_ma5 and last_ma5 >= last_ma20) else 0.0)
+    
+    # 3. 籌碼與共振加乘
+    vol_sheets = float(row_match.get("volume_sheets", 1000.0))
+    is_fund_good = bool(pe_val <= 28 and dy_val >= 1.5)
+    is_tech_good = bool(last_close >= last_ma20 and last_rsi >= 50.0)
+    is_mkt_good = bool(vol_ratio >= 1.2 or vol_sheets >= 2000.0)
+    
+    resonance_hits = int(is_fund_good) + int(is_tech_good) + int(is_mkt_good)
+    multiplier = 1.35 if resonance_hits == 3 else (1.15 if resonance_hits == 2 else 1.0)
+    
+    raw_score = (fund_base + tech_base) * multiplier
+    
+    # 4. 破壞性扣分
+    penalties = 0.0
+    bias_ma20 = (last_close - last_ma20) / last_ma20 if last_ma20 > 0 else 0.0
+    if bias_ma20 > 0.15: penalties += 25.0
+    if is_high_10d and vol_ratio < 0.70: penalties += 20.0
+    ma60_slope_down = (last_ma60 < prev_ma60)
+    if ma60_slope_down and last_close < last_ma60: penalties += 25.0
+    
+    final_stock_score = round(max(raw_score - penalties, 10.0), 1)
+
+    pricing = compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60, last_rsi, last_atr, vol_ratio, is_high_10d)
     
     pe_str = f"{row_match['pe_ratio']:.1f} 倍" if pd.notnull(row_match.get("pe_ratio")) and row_match["pe_ratio"] > 0 else "-"
     dy_str = f"{row_match['dividend_yield']:.1f}%" if pd.notnull(row_match.get("dividend_yield")) and row_match["dividend_yield"] > 0 else "-"
@@ -918,6 +968,7 @@ def get_single_stock_metrics(row_match, lookback_days):
         "代號": sid,
         "名稱": row_match["stock_name"],
         "市場": market,
+        "綜合評分": final_stock_score,
         "收盤價": round(last_close, 2),
         f"近{lookback_days}日報酬(%)": ret_period,
         "月線順勢勝率(%)": win_rate,
@@ -929,7 +980,7 @@ def get_single_stock_metrics(row_match, lookback_days):
         "中長目標賣出": pricing["mid_target"]
     }])
 
-    return table_df, pricing["summary_text"], pricing["prediction_text"]
+    return table_df, pricing["summary_text"], pricing["prediction_text"], final_stock_score
 
 @st.dialog("🔍 個股深度分析與行情預測", width="large")
 def show_single_stock_analysis_modal(full_universe_df, lookback_days):
@@ -948,32 +999,27 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days):
     ).strip().upper()
     
     target_row = None
+    not_found = False
+
     if manual_code:
         matches = full_universe_df[full_universe_df["stock_id"] == manual_code]
         if not matches.empty:
             target_row = matches.iloc[0].to_dict()
         else:
-            is_etf = manual_code.startswith("00")
-            target_row = {
-                "stock_id": manual_code,
-                "stock_name": f"{manual_code} (指定標的)",
-                "market": "上市 ETF" if is_etf else "上市",
-                "close": 100.0,
-                "pe_ratio": np.nan,
-                "dividend_yield": np.nan,
-                "volume_sheets": 1000.0
-            }
+            not_found = True
     elif selected_str:
         sid = selected_str.split(" - ")[0]
         target_row = full_universe_df[full_universe_df["stock_id"] == sid].iloc[0].to_dict()
 
-    if target_row:
+    if not_found:
+        st.error(f"⚠️ 查無代號「{manual_code}」之台股或 ETF 資料，請確認代號是否輸入正確。")
+    elif target_row:
         st.markdown("---")
-        st.markdown(f"### 🎯 分析標的：`{target_row['stock_id']}` **{target_row['stock_name']}** ({target_row['market']})")
-        
         with st.spinner("正在運算量化指標與買賣建議..."):
-            stock_table_df, summary_text, prediction_text = get_single_stock_metrics(target_row, lookback_days)
+            stock_table_df, summary_text, prediction_text, final_stock_score = get_single_stock_metrics(target_row, lookback_days)
             
+        st.markdown(f"### 🎯 分析標的：`{target_row['stock_id']}` **{target_row['stock_name']}** ({target_row['market']}) ｜ 綜合評分：`{final_stock_score:.1f}`")
+        
         st.markdown("#### 📋 1. 核心量化指標總覽")
         st.dataframe(stock_table_df, use_container_width=True, hide_index=True)
         st.info(f"💡 **標的盤勢總結**：{summary_text}")
@@ -1122,12 +1168,12 @@ def show_stock_picks_modal(full_universe_df):
     with c_btn_next:
         if st.button("🔄 不滿意，換一批", type="primary", use_container_width=True):
             st.session_state.batch_page = (st.session_state.batch_page + 1) % total_batches
-            st.session_state.show_picks_modal = True  # 確保 rerun 後自動再次開啟彈窗
+            st.session_state.show_picks_modal = True
             st.rerun()
     with c_btn_first:
         if st.button("⏮️ 回到第 1 批", use_container_width=True):
             st.session_state.batch_page = 0
-            st.session_state.show_picks_modal = True  # 確保 rerun 後自動再次開啟彈窗
+            st.session_state.show_picks_modal = True
             st.rerun()
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
@@ -1185,11 +1231,9 @@ if "force_refresh_cache" not in st.session_state:
 if "show_picks_modal" not in st.session_state:
     st.session_state.show_picks_modal = False
 
-# 背景載入數據
 with st.spinner("🚀 載入市場數據中..."):
     force_run = st.session_state.force_refresh_cache
     if force_run:
-        # 強制實體刪除快取檔，確保重新拉取官方最新資料
         if os.path.exists(CACHE_PARQUET_FILE):
             try: os.remove(CACHE_PARQUET_FILE)
             except Exception: pass
@@ -1203,7 +1247,6 @@ with st.spinner("🚀 載入市場數據中..."):
         st.session_state.force_refresh_cache = False
         st.toast("✅ 已強制向證交所同步最新盤後資料！")
 
-# 若處於「精選推薦」開啟狀態（例如點了換一批後 rerun），自動呼叫彈窗
 if st.session_state.show_picks_modal:
     show_stock_picks_modal(full_universe_df)
 
@@ -1225,7 +1268,6 @@ with col_main_wrap_2:
         if st.button("🔍 個股分析", key="btn_nav_stock", use_container_width=True):
             show_single_stock_analysis_modal(full_universe_df, lookback_days=120)
 
-    # 點選精選推薦，設置標記並開啟
     if st.button("🎯 精選推薦個股", key="btn_nav_picks", use_container_width=True):
         st.session_state.show_picks_modal = True
         show_stock_picks_modal(full_universe_df)
