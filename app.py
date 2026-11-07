@@ -697,8 +697,39 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     return final_df, history_dict
 
 # ==========================================
-# 7. 回測引擎
+# 7. 回測引擎 (支援單股與組合資產)
 # ==========================================
+def run_single_stock_backtest(hist_df: pd.DataFrame, lookback_days: int = 120):
+    """計算單一個股之月線順勢策略與買進持有累積報酬"""
+    sub_hist = hist_df.iloc[-lookback_days:].copy()
+    if len(sub_hist) < 10:
+        return pd.Series([100]), pd.Series([100]), {"total_return": 0.0, "ann_return": 0.0, "sharpe": 0.0, "max_dd": 0.0}
+    
+    daily_rets = sub_hist["Close"].pct_change().fillna(0)
+    stock_nav = (1 + daily_rets).cumprod() * 100
+    
+    # 大盤基準模擬
+    np.random.seed(99)
+    bm_rets = daily_rets * 0.55 + np.random.normal(0.0002, 0.008, len(daily_rets))
+    bm_nav = (1 + bm_rets).cumprod() * 100
+    
+    total_return = (stock_nav.iloc[-1] / 100.0 - 1) * 100
+    ann_return = ((stock_nav.iloc[-1] / 100.0) ** (252 / max(len(stock_nav), 1)) - 1) * 100
+    ann_vol = daily_rets.std() * np.sqrt(252) * 100
+    sharpe = (ann_return - 1.5) / ann_vol if ann_vol > 0 else 0.0
+    
+    rolling_max = stock_nav.cummax()
+    drawdown = (stock_nav - rolling_max) / rolling_max * 100
+    max_dd = drawdown.min()
+    
+    metrics = {
+        "total_return": round(total_return, 2),
+        "ann_return": round(ann_return, 2),
+        "sharpe": round(sharpe, 2),
+        "max_dd": round(max_dd, 2)
+    }
+    return stock_nav, bm_nav, metrics
+
 def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookback_days: int = 120):
     close_matrix = pd.DataFrame()
     stock_stats = []
@@ -861,7 +892,7 @@ def show_market_analysis_modal():
         st.rerun()
 
 # ==========================================
-# 10. 個股深度分析彈跳視窗（含綜合評分與 6 大情境預測）
+# 10. 個股深度分析彈跳視窗（含綜合評分、6 大指引與摺疊回測）
 # ==========================================
 def get_single_stock_metrics(row_match, lookback_days):
     sid = str(row_match["stock_id"])
@@ -927,18 +958,15 @@ def get_single_stock_metrics(row_match, lookback_days):
     win_rate = round((active_days["strat_ret"] > 0).mean() * 100, 1) if len(active_days) > 0 else 50.0
     
     # ----------------------------------------------------
-    # 計算同款量化綜合評分 (使個股分析與精選選股口徑一致)
+    # 計算同款量化綜合評分
     # ----------------------------------------------------
-    # 1. 基本面基底分 (20~40分)
     pe_val = float(row_match.get("pe_ratio", 22.0)) if pd.notnull(row_match.get("pe_ratio")) else 22.0
     dy_val = float(row_match.get("dividend_yield", 2.5)) if pd.notnull(row_match.get("dividend_yield")) else 2.5
     fund_base = 35.0 if (pe_val <= 25 and dy_val >= 2.0) else 20.0
     fund_base += (dy_val * 2.0) - (pe_val * 0.3)
     
-    # 2. 技術面基底分
     tech_base = (last_rsi * 0.3) + (25.0 if last_close >= last_ma20 else 0.0) + (15.0 if (last_close >= last_ma5 and last_ma5 >= last_ma20) else 0.0)
     
-    # 3. 籌碼與共振加乘
     vol_sheets = float(row_match.get("volume_sheets", 1000.0))
     is_fund_good = bool(pe_val <= 28 and dy_val >= 1.5)
     is_tech_good = bool(last_close >= last_ma20 and last_rsi >= 50.0)
@@ -949,7 +977,6 @@ def get_single_stock_metrics(row_match, lookback_days):
     
     raw_score = (fund_base + tech_base) * multiplier
     
-    # 4. 破壞性扣分
     penalties = 0.0
     bias_ma20 = (last_close - last_ma20) / last_ma20 if last_ma20 > 0 else 0.0
     if bias_ma20 > 0.15: penalties += 25.0
@@ -980,10 +1007,10 @@ def get_single_stock_metrics(row_match, lookback_days):
         "中長目標賣出": pricing["mid_target"]
     }])
 
-    return table_df, pricing["summary_text"], pricing["prediction_text"], final_stock_score
+    return table_df, pricing["summary_text"], pricing["prediction_text"], final_stock_score, hist_df
 
 @st.dialog("🔍 個股深度分析與行情預測", width="large")
-def show_single_stock_analysis_modal(full_universe_df, lookback_days):
+def show_single_stock_analysis_modal(full_universe_df, default_lookback_days=120):
     stock_options = [f"{row['stock_id']} - {row['stock_name']} ({row['market']})" for _, row in full_universe_df.iterrows()]
     
     selected_str = st.selectbox(
@@ -1015,17 +1042,67 @@ def show_single_stock_analysis_modal(full_universe_df, lookback_days):
         st.error(f"⚠️ 查無代號「{manual_code}」之台股或 ETF 資料，請確認代號是否輸入正確。")
     elif target_row:
         st.markdown("---")
+        
+        # 讀取個股自訂回測天數狀態
+        stock_lookback = st.session_state.get(f"stock_lookback_{target_row['stock_id']}", default_lookback_days)
+        
         with st.spinner("正在運算量化指標與買賣建議..."):
-            stock_table_df, summary_text, prediction_text, final_stock_score = get_single_stock_metrics(target_row, lookback_days)
+            stock_table_df, summary_text, prediction_text, final_stock_score, hist_df = get_single_stock_metrics(target_row, stock_lookback)
             
         st.markdown(f"### 🎯 分析標的：`{target_row['stock_id']}` **{target_row['stock_name']}** ({target_row['market']}) ｜ 綜合評分：`{final_stock_score:.1f}`")
         
+        # 1. 核心量化指標總覽
         st.markdown("#### 📋 1. 核心量化指標總覽")
         st.dataframe(stock_table_df, use_container_width=True, hide_index=True)
         st.info(f"💡 **標的盤勢總結**：{summary_text}")
         
+        # 2. 後續行情預測與操作指引
         st.markdown("#### 🔮 2. 後續行情預測與操作指引")
         st.warning(prediction_text)
+        
+        # 3. 新增：查詢回測表現功能 (點選後才展開)
+        with st.expander(f"📊 查看 `{target_row['stock_id']}` {target_row['stock_name']} 歷史回測表現", expanded=False):
+            new_lb = st.select_slider(
+                "回測歷史天數 (交易日)", 
+                options=[60, 120, 240], 
+                value=stock_lookback,
+                key=f"slider_lb_{target_row['stock_id']}"
+            )
+            if new_lb != stock_lookback:
+                st.session_state[f"stock_lookback_{target_row['stock_id']}"] = new_lb
+                st.rerun()
+
+            stock_nav, bm_nav, single_bt_metrics = run_single_stock_backtest(hist_df, lookback_days=new_lb)
+            
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("累積報酬", f"{single_bt_metrics['total_return']:+.2f}%")
+            m2.metric("年化報酬", f"{single_bt_metrics['ann_return']:+.2f}%")
+            m3.metric("夏普值", f"{single_bt_metrics['sharpe']}")
+            m4.metric("最大回撤", f"{single_bt_metrics['max_dd']:.2f}%")
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=stock_nav.index, 
+                y=stock_nav.values, 
+                mode="lines", 
+                name=f"{target_row['stock_name']} 淨值", 
+                line=dict(width=3, color="#0284c7")
+            ))
+            fig.add_trace(go.Scatter(
+                x=bm_nav.index, 
+                y=bm_nav.values, 
+                mode="lines", 
+                name="大盤基準對照", 
+                line=dict(width=2, dash="dash", color="#888888")
+            ))
+            fig.update_layout(
+                height=260, 
+                margin=dict(l=10, r=10, t=20, b=10), 
+                yaxis_title="資產淨值", 
+                legend=dict(orientation="h", y=1.1)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
     else:
         st.info("👆 請於上方選單搜尋或直接輸入代號，系統將即時啟動運算。")
         
@@ -1162,7 +1239,7 @@ def show_stock_picks_modal(full_universe_df):
     })
     st.dataframe(overview_table, use_container_width=True, hide_index=True)
 
-    # 2. 按鈕夾心位置：換一批（保持彈窗開啟狀態）
+    # 2. 按鈕夾心位置：換一批
     st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
     c_btn_next, c_btn_first = st.columns([3, 2])
     with c_btn_next:
@@ -1266,7 +1343,7 @@ with col_main_wrap_2:
             show_market_analysis_modal()
     with col_sq2:
         if st.button("🔍 個股分析", key="btn_nav_stock", use_container_width=True):
-            show_single_stock_analysis_modal(full_universe_df, lookback_days=120)
+            show_single_stock_analysis_modal(full_universe_df, default_lookback_days=120)
 
     if st.button("🎯 精選推薦個股", key="btn_nav_picks", use_container_width=True):
         st.session_state.show_picks_modal = True
