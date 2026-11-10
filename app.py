@@ -228,29 +228,60 @@ def parse_tw_roc_date(roc_date_str: str) -> str:
     tw_now = datetime.utcnow() + timedelta(hours=8)
     return f"{tw_now.strftime('%Y-%m-%d')} ({weekday_map.get(tw_now.weekday(), '')})"
 
+def parse_twse_date_to_date(roc_date_str: str):
+    """將證交所民國年字串 (如 1150310) 轉換為 Python date 物件"""
+    try:
+        clean = re.sub(r"[^\d]", "", str(roc_date_str))
+        if len(clean) >= 7:
+            year = int(clean[:3]) + 1911
+            month = int(clean[3:5])
+            day = int(clean[5:7])
+            return datetime(year, month, day).date()
+    except Exception:
+        pass
+    return None
+
+def get_expected_latest_trading_date():
+    """計算當前時間點，市場預期應有的最新盤後資料交易日"""
+    now = datetime.now()
+    # 台股盤後資料約在下午 15:30 ~ 16:00 正式出齊
+    today_after_market = (now.time() >= datetime.strptime("15:30", "%H:%M").time())
+    
+    candidate = now.date() if today_after_market else (now.date() - timedelta(days=1))
+    
+    # 遇週末往前回溯至週五
+    while candidate.weekday() >= 5:  # 5=週六, 6=週日
+        candidate -= timedelta(days=1)
+    return candidate
+
 # ==========================================
-# 2. 全市場真實數據擷取（強化防快取與即時更新）
+# 2. 全市場真實數據擷取（交易日感知防快取錯位版）
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
+    expected_date = get_expected_latest_trading_date()
+    
+    # 1. 檢查本機快取是否存在且已是預期交易日
     if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
         try:
             with open(META_JSON_FILE, "r", encoding="utf-8") as f:
                 meta_info = json.load(f)
+            cached_data_date_str = meta_info.get("data_date", "")
             cached_label = meta_info.get("tw_date_label", "")
-            mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
-            if (datetime.now() - mtime).total_seconds() < 14400 and cached_label:
+            
+            # 若快取記錄的資料日期，與當前預期應取得的最新交易日相符，直接讀取
+            if cached_data_date_str == str(expected_date) and cached_label:
                 df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
-                if not df_cached.empty and len(df_cached) >= 1000 and df_cached["stock_id"].str.startswith("00").any():
+                if not df_cached.empty and len(df_cached) >= 1000:
                     df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
                     return df_cached, cached_label
         except Exception:
             pass
 
+    # 2. 若快取不存在、被強制更新，或快取日期落後於預期日期，才連線抓取
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache",
-        "Expires": "0"
+        "Pragma": "no-cache"
     }
     market_rows = []
     twse_raw_date_str = ""
@@ -349,10 +380,13 @@ def fetch_full_market_universe(force_refresh: bool = False):
     full_df = pd.DataFrame(market_rows)
 
     if full_df.empty or len(full_df) < 50:
+        if os.path.exists(CACHE_PARQUET_FILE):
+            return pd.read_parquet(CACHE_PARQUET_FILE), "歷史離線快取"
         st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線。")
         st.stop()
 
     actual_tw_label = parse_tw_roc_date(twse_raw_date_str)
+    real_data_date = parse_twse_date_to_date(twse_raw_date_str) or expected_date
 
     try:
         save_cols = [
@@ -364,8 +398,12 @@ def fetch_full_market_universe(force_refresh: bool = False):
         if os.path.exists(CACHE_PARQUET_FILE):
             os.remove(CACHE_PARQUET_FILE)
         os.rename(temp_file, CACHE_PARQUET_FILE)
+        
         with open(META_JSON_FILE, "w", encoding="utf-8") as f:
-            json.dump({"tw_date_label": actual_tw_label}, f)
+            json.dump({
+                "tw_date_label": actual_tw_label,
+                "data_date": str(real_data_date)
+            }, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -708,7 +746,6 @@ def run_single_stock_backtest(hist_df: pd.DataFrame, lookback_days: int = 120):
     daily_rets = sub_hist["Close"].pct_change().fillna(0)
     stock_nav = (1 + daily_rets).cumprod() * 100
     
-    # 大盤基準模擬
     np.random.seed(99)
     bm_rets = daily_rets * 0.55 + np.random.normal(0.0002, 0.008, len(daily_rets))
     bm_nav = (1 + bm_rets).cumprod() * 100
@@ -1043,7 +1080,6 @@ def show_single_stock_analysis_modal(full_universe_df, default_lookback_days=120
     elif target_row:
         st.markdown("---")
         
-        # 讀取個股自訂回測天數狀態
         stock_lookback = st.session_state.get(f"stock_lookback_{target_row['stock_id']}", default_lookback_days)
         
         with st.spinner("正在運算量化指標與買賣建議..."):
@@ -1051,16 +1087,13 @@ def show_single_stock_analysis_modal(full_universe_df, default_lookback_days=120
             
         st.markdown(f"### 🎯 分析標的：`{target_row['stock_id']}` **{target_row['stock_name']}** ({target_row['market']}) ｜ 綜合評分：`{final_stock_score:.1f}`")
         
-        # 1. 核心量化指標總覽
         st.markdown("#### 📋 1. 核心量化指標總覽")
         st.dataframe(stock_table_df, use_container_width=True, hide_index=True)
         st.info(f"💡 **標的盤勢總結**：{summary_text}")
         
-        # 2. 後續行情預測與操作指引
         st.markdown("#### 🔮 2. 後續行情預測與操作指引")
         st.warning(prediction_text)
         
-        # 3. 新增：查詢回測表現功能 (點選後才展開)
         with st.expander(f"📊 查看 `{target_row['stock_id']}` {target_row['stock_name']} 歷史回測表現", expanded=False):
             new_lb = st.select_slider(
                 "回測歷史天數 (交易日)", 
