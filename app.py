@@ -4,7 +4,7 @@ import numpy as np
 import requests
 import yfinance as yf
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import re
 import os
 import json
@@ -225,11 +225,10 @@ def parse_tw_roc_date(roc_date_str: str) -> str:
             return f"{dt.strftime('%Y-%m-%d')} ({weekday_map.get(dt.weekday(), '')})"
     except Exception:
         pass
-    tw_now = datetime.utcnow() + timedelta(hours=8)
+    tw_now = datetime.now()
     return f"{tw_now.strftime('%Y-%m-%d')} ({weekday_map.get(tw_now.weekday(), '')})"
 
 def parse_twse_date_to_date(roc_date_str: str):
-    """將證交所民國年字串 (如 1150310) 轉換為 Python date 物件"""
     try:
         clean = re.sub(r"[^\d]", "", str(roc_date_str))
         if len(clean) >= 7:
@@ -241,43 +240,61 @@ def parse_twse_date_to_date(roc_date_str: str):
         pass
     return None
 
-def get_expected_latest_trading_date():
-    """計算當前時間點，市場預期應有的最新盤後資料交易日"""
+# ==========================================
+# 2. 全市場真實數據擷取（盤後時段鎖定機制 - 徹底解決夜間與開盤前跳日前問題）
+# ==========================================
+def should_attempt_market_update(force_refresh: bool) -> bool:
+    """判斷當前時段是否應該發起網路請求抓取新資料"""
+    if force_refresh:
+        return True
+    
+    # 若本機連快取檔案都不存在，必須強制抓一次
+    if not os.path.exists(CACHE_PARQUET_FILE) or not os.path.exists(META_JSON_FILE):
+        return True
+        
     now = datetime.now()
-    # 台股盤後資料約在下午 15:30 ~ 16:00 正式出齊
-    today_after_market = (now.time() >= datetime.strptime("15:30", "%H:%M").time())
-    
-    candidate = now.date() if today_after_market else (now.date() - timedelta(days=1))
-    
-    # 遇週末往前回溯至週五
-    while candidate.weekday() >= 5:  # 5=週六, 6=週日
-        candidate -= timedelta(days=1)
-    return candidate
+    # 週末不發出自動抓取請求
+    if now.weekday() >= 5:
+        return False
+        
+    # 平日：只有在 15:30 ~ 23:59 之間才允許自動更新
+    market_close_time = time(15, 30)
+    if now.time() < market_close_time:
+        # 午夜 00:00 到下午 15:29 之間，嚴禁自動發起網路更新，百分之百讀取現有快取
+        return False
+        
+    # 如果已經在 15:30 之後，檢查快取的資料日期是否已經是今天
+    try:
+        with open(META_JSON_FILE, "r", encoding="utf-8") as f:
+            meta_info = json.load(f)
+        cached_date_str = meta_info.get("data_date", "")
+        # 如果快取日期已經是今天，代表今天下午已經成功抓過，無需重複抓取
+        if cached_date_str == str(now.date()):
+            return False
+    except Exception:
+        return True
+        
+    return True
 
-# ==========================================
-# 2. 全市場真實數據擷取（交易日感知防快取錯位版）
-# ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
-    expected_date = get_expected_latest_trading_date()
+    can_read_cache = os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE)
     
-    # 1. 檢查本機快取是否存在且已是預期交易日
-    if not force_refresh and os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE):
+    # 1. 判斷是否需要觸發網路連線
+    need_update = should_attempt_market_update(force_refresh)
+    
+    if not need_update and can_read_cache:
         try:
             with open(META_JSON_FILE, "r", encoding="utf-8") as f:
                 meta_info = json.load(f)
-            cached_data_date_str = meta_info.get("data_date", "")
             cached_label = meta_info.get("tw_date_label", "")
-            
-            # 若快取記錄的資料日期，與當前預期應取得的最新交易日相符，直接讀取
-            if cached_data_date_str == str(expected_date) and cached_label:
-                df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
-                if not df_cached.empty and len(df_cached) >= 1000:
-                    df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
-                    return df_cached, cached_label
+            df_cached = pd.read_parquet(CACHE_PARQUET_FILE)
+            if not df_cached.empty and len(df_cached) >= 1000:
+                df_cached["themes"] = df_cached["stock_id"].apply(get_stock_themes)
+                return df_cached, cached_label
         except Exception:
             pass
 
-    # 2. 若快取不存在、被強制更新，或快取日期落後於預期日期，才連線抓取
+    # 2. 進入抓取流程 (僅限 15:30 後或強制更新)
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -379,14 +396,31 @@ def fetch_full_market_universe(force_refresh: bool = False):
 
     full_df = pd.DataFrame(market_rows)
 
+    # 防禦降級：若抓取筆數不足但本地有快取，絕對保留既有快取
     if full_df.empty or len(full_df) < 50:
-        if os.path.exists(CACHE_PARQUET_FILE):
-            return pd.read_parquet(CACHE_PARQUET_FILE), "歷史離線快取"
+        if can_read_cache:
+            with open(META_JSON_FILE, "r", encoding="utf-8") as f:
+                meta_info = json.load(f)
+            return pd.read_parquet(CACHE_PARQUET_FILE), meta_info.get("tw_date_label", "歷史交易日")
         st.error("⚠️ 無法連線至證交所或櫃買中心取得最新盤後行情，請確認網路連線。")
         st.stop()
 
     actual_tw_label = parse_tw_roc_date(twse_raw_date_str)
-    real_data_date = parse_twse_date_to_date(twse_raw_date_str) or expected_date
+    real_data_date = parse_twse_date_to_date(twse_raw_date_str) or datetime.now().date()
+
+    # 3. 確保抓到的不是比現有快取更舊的資料才覆蓋
+    if can_read_cache and not force_refresh:
+        try:
+            with open(META_JSON_FILE, "r", encoding="utf-8") as f:
+                old_meta = json.load(f)
+            old_date_str = old_meta.get("data_date", "")
+            if old_date_str and str(real_data_date) < old_date_str:
+                # 抓到的日期竟然比本地快取更舊（API維護異常），放棄覆蓋，保留新快取
+                df_old = pd.read_parquet(CACHE_PARQUET_FILE)
+                df_old["themes"] = df_old["stock_id"].apply(get_stock_themes)
+                return df_old, old_meta.get("tw_date_label", "")
+        except Exception:
+            pass
 
     try:
         save_cols = [
@@ -535,7 +569,7 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60
     }
 
 # ==========================================
-# 5. 獨立 K 線歷史資料記憶體快取模組
+# 5. 獨立 K 線歷史資料記憶體快取模組（防時區跨日擾動）
 # ==========================================
 @st.cache_data(ttl=14400, show_spinner=False)
 def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
@@ -553,7 +587,10 @@ def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
         if not raw.empty and len(raw) > 20:
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(0)
-            hist_df = raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
+            # 過濾成交量為 0 的非正常交易空行
+            clean_raw = raw[raw["Volume"] > 0]
+            if not clean_raw.empty:
+                hist_df = clean_raw[["Open", "High", "Low", "Close", "Volume"]].dropna().copy()
     except Exception:
         hist_df = pd.DataFrame()
         
@@ -738,7 +775,6 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
 # 7. 回測引擎 (支援單股與組合資產)
 # ==========================================
 def run_single_stock_backtest(hist_df: pd.DataFrame, lookback_days: int = 120):
-    """計算單一個股之月線順勢策略與買進持有累積報酬"""
     sub_hist = hist_df.iloc[-lookback_days:].copy()
     if len(sub_hist) < 10:
         return pd.Series([100]), pd.Series([100]), {"total_return": 0.0, "ann_return": 0.0, "sharpe": 0.0, "max_dd": 0.0}
@@ -834,12 +870,12 @@ def get_live_market_data():
             if not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
-                closes = df["Close"].dropna()
-                if len(closes) >= 2:
-                    curr = float(closes.iloc[-1])
-                    prev = float(closes.iloc[-2])
+                clean_closes = df[df["Volume"] > 0]["Close"].dropna()
+                if len(clean_closes) >= 2:
+                    curr = float(clean_closes.iloc[-1])
+                    prev = float(clean_closes.iloc[-2])
                     pct = (curr / prev - 1) * 100
-                    dt_str = closes.index[-1].strftime("%Y-%m-%d")
+                    dt_str = clean_closes.index[-1].strftime("%Y-%m-%d")
                     data[chinese_name] = {"close": round(curr, 2), "pct": round(pct, 2), "date": dt_str}
         except Exception:
             pass
@@ -1150,7 +1186,6 @@ def show_single_stock_analysis_modal(full_universe_df, default_lookback_days=120
 def show_stock_picks_modal(full_universe_df):
     st.markdown("### ⚙️ 設定選股方向")
     
-    # 嚴格順序：1. 基本面
     st.markdown('<div class="factor-title">', unsafe_allow_html=True)
     u_fund = st.checkbox("1. 基本面", value=st.session_state.get("cfg_fund", True))
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1164,7 +1199,6 @@ def show_stock_picks_modal(full_universe_df):
     if not l_fund: l_fund = "穩健成長"
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    # 嚴格順序：2. 技術面
     st.markdown('<div class="factor-title">', unsafe_allow_html=True)
     u_tech = st.checkbox("2. 技術面", value=st.session_state.get("cfg_tech", True))
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1178,7 +1212,6 @@ def show_stock_picks_modal(full_universe_df):
     if not l_tech: l_tech = "強勢突破"
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    # 嚴格順序：3. 籌碼面
     st.markdown('<div class="factor-title">', unsafe_allow_html=True)
     u_mkt = st.checkbox("3. 籌碼面", value=st.session_state.get("cfg_mkt", True))
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1192,7 +1225,6 @@ def show_stock_picks_modal(full_universe_df):
     if not l_mkt: l_mkt = "法人溫和布局"
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    # 嚴格順序：4. 熱門題材 (垂直直向排列)
     st.markdown('<div class="factor-title">', unsafe_allow_html=True)
     u_thm = st.checkbox("4. 熱門題材", value=st.session_state.get("cfg_thm", False))
     st.markdown('</div>', unsafe_allow_html=True)
@@ -1214,7 +1246,6 @@ def show_stock_picks_modal(full_universe_df):
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
-    # 狀態紀錄
     st.session_state.cfg_fund = u_fund
     st.session_state.cfg_tech = u_tech
     st.session_state.cfg_mkt = u_mkt
@@ -1231,7 +1262,6 @@ def show_stock_picks_modal(full_universe_df):
 
     st.markdown("---")
 
-    # 局部運算
     with st.spinner("🚀 正在運算量化模型並篩選前 25 檔精選個股..."):
         selections = {
             "fundamental": {"enabled": u_fund, "level": l_fund},
@@ -1254,7 +1284,6 @@ def show_stock_picks_modal(full_universe_df):
 
     st.markdown(f"#### 🎯 精選推薦（第 {current_page + 1} / {total_batches} 批，共 5 檔）")
 
-    # 1. 總覽數據表格
     overview_merge = pd.merge(
         current_5_df[["stock_id", "stock_name", "market", "close", "short_buy_range", "short_target", "mid_buy_range", "mid_target"]],
         stock_bt_df[["代號", f"近{active_lookback}日報酬(%)", "月線順勢勝率(%)"]],
@@ -1272,7 +1301,6 @@ def show_stock_picks_modal(full_universe_df):
     })
     st.dataframe(overview_table, use_container_width=True, hide_index=True)
 
-    # 2. 按鈕夾心位置：換一批
     st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
     c_btn_next, c_btn_first = st.columns([3, 2])
     with c_btn_next:
@@ -1287,7 +1315,6 @@ def show_stock_picks_modal(full_universe_df):
             st.rerun()
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
 
-    # 3. 精選 5 檔詳細建議卡片
     for rank_num, (_, row) in enumerate(current_5_df.iterrows(), start=start_idx + 1):
         with st.container(border=True):
             st.markdown(f"#### #{rank_num} `{row['stock_id']}` **{row['stock_name']}** ({row['market']}) ｜ 收盤：`{row['close']}` 元")
@@ -1307,7 +1334,6 @@ def show_stock_picks_modal(full_universe_df):
                 st.markdown("**🧭 中長操作 (1~6個月)**")
                 st.markdown(f"• 買入：`{row['mid_buy_range']}`\n• 停利：`{row['mid_target']}`\n• 停損：`{row['mid_stop']}`")
 
-    # 4. 回測資訊摺疊區
     with st.expander("📊 查看本批 5 檔回測表現", expanded=False):
         new_lookback = st.select_slider("回測歷史天數 (交易日)", options=[60, 120, 240], value=active_lookback)
         if new_lookback != active_lookback:
