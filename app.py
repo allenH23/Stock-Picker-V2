@@ -214,7 +214,6 @@ def refresh_market_themes():
     st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
 
 def parse_tw_roc_date_str(roc_date_str: str) -> tuple[str, str]:
-    """將證交所民國年字串解析為 (標準YYYY-MM-DD, 顯示中文標籤)"""
     weekday_map = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
     try:
         clean = re.sub(r"[^\d]", "", str(roc_date_str))
@@ -233,7 +232,7 @@ def parse_tw_roc_date_str(roc_date_str: str) -> tuple[str, str]:
     return date_key, f"{date_key} ({weekday_map.get(tw_now.weekday(), '')})"
 
 # ==========================================
-# 2. 全市場真實數據擷取（單向只進不退機制：白天時時更新，晚上絕不回退）
+# 2. 全市場真實數據擷取（單向只進不退保護罩）
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
     can_read_cache = os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE)
@@ -247,7 +246,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
             cached_date_key = meta_info.get("data_date", "")
             cached_label = meta_info.get("tw_date_label", "")
             
-            # 若不是手動強制刷新，且快取建立在 45 分鐘內，優先快速讀取
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
             if not force_refresh and (datetime.now() - mtime).total_seconds() < 2700 and cached_date_key:
                 df_c = pd.read_parquet(CACHE_PARQUET_FILE)
@@ -257,7 +255,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
         except Exception:
             pass
 
-    # 發出網路請求抓取最新行情
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -359,7 +356,6 @@ def fetch_full_market_universe(force_refresh: bool = False):
 
     full_df = pd.DataFrame(market_rows)
 
-    # 異常降級：抓取失敗時優先保留快取
     if full_df.empty or len(full_df) < 50:
         if can_read_cache:
             df_fallback = pd.read_parquet(CACHE_PARQUET_FILE)
@@ -370,17 +366,12 @@ def fetch_full_market_universe(force_refresh: bool = False):
 
     new_date_key, new_display_label = parse_tw_roc_date_str(twse_raw_date_str)
 
-    # ========================================================
-    # 核心修復：單向只進不退保護罩（Monotonic Protection）
-    # 如果證交所夜間回傳的日期 < 現有快取的日期，絕對拒絕覆蓋！
-    # ========================================================
+    # 單向只進不退保護：若 API 夜間吐出舊日期，絕對不覆蓋
     if can_read_cache and cached_date_key and (new_date_key < cached_date_key):
-        # 證交所 API 處於夜間維護舊快照狀態，直接丟棄舊回應，保護今天的好資料
         df_protect = pd.read_parquet(CACHE_PARQUET_FILE)
         df_protect["themes"] = df_protect["stock_id"].apply(get_stock_themes)
         return df_protect, cached_label
 
-    # 資料有效且日期 >= 現有快取，正常存檔
     try:
         save_cols = [
             "stock_id", "stock_name", "market", "close", 
@@ -456,7 +447,6 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60
     bias_ma20 = (last_close - last_ma20) / last_ma20 if last_ma20 > 0 else 0.0
     ma60_slope_down = (last_ma60 < prev_ma60)
 
-    # 1. 買賣建議區間基準計算
     if last_close >= last_ma20 and last_rsi >= 50:
         short_buy_low = round(min(last_ma5 - 0.2 * last_atr, last_close - 0.4 * last_atr), 2)
         short_buy_high = round(min(last_close, max(last_ma5, last_close - 0.1 * last_atr)), 2)
@@ -496,7 +486,6 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60
         mid_target = round(last_close + 3.5 * last_atr, 2)
         mid_stop = round(last_ma60 * 0.97, 2)
 
-    # 2. 個股後續行情預測與操作指引（6 大情境）
     if ma60_slope_down and last_close < last_ma60:
         summary_text = f"股價跌破季線（{last_ma60:.1f}）且季線呈現下彎蓋頭壓制，中長線架構偏空，下檔支撐待測。"
         prediction_text = "🛡️ **【情境：破線走空】➔ 操作指引：『嚴控風險，持股應停損換股或空手避開』**\n\n* **結構分析**：中長期趨勢轉空，上方均線形成沉重套牢賣壓。\n* **操作指引**：反彈皆為減碼點，切勿逢低加碼或攤平，待中長線打出底部結構再重新評估。"
@@ -528,7 +517,7 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60
     }
 
 # ==========================================
-# 5. 獨立 K 線歷史資料記憶體快取模組（精準過濾非交易日）
+# 5. 獨立 K 線歷史資料記憶體快取模組
 # ==========================================
 @st.cache_data(ttl=14400, show_spinner=False)
 def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
@@ -546,7 +535,6 @@ def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
         if not raw.empty and len(raw) > 20:
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(0)
-            # 排除量為 0 的未來/空資料
             valid_rows = raw[raw["Volume"] > 0].dropna()
             if not valid_rows.empty:
                 hist_df = valid_rows[["Open", "High", "Low", "Close", "Volume"]].copy()
@@ -812,7 +800,7 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 8. 即時國際指數抓取與 6 大細分情境盤勢指引
+# 8. 即時國際指數抓取（修正點：指數不卡 Volume > 0 限制，確保即日可見）
 # ==========================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_live_market_data():
@@ -829,7 +817,8 @@ def get_live_market_data():
             if not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
-                clean_closes = df[df["Volume"] > 0]["Close"].dropna()
+                # 重要修復：指數沒有正常 Volume 欄位，直接 dropna 取最後兩筆 Close
+                clean_closes = df["Close"].dropna()
                 if len(clean_closes) >= 2:
                     curr = float(clean_closes.iloc[-1])
                     prev = float(clean_closes.iloc[-2])
@@ -989,7 +978,6 @@ def get_single_stock_metrics(row_match, lookback_days):
     active_days = hist_df[hist_df["signal"] == 1]
     win_rate = round((active_days["strat_ret"] > 0).mean() * 100, 1) if len(active_days) > 0 else 50.0
     
-    # 計算同款量化綜合評分
     pe_val = float(row_match.get("pe_ratio", 22.0)) if pd.notnull(row_match.get("pe_ratio")) else 22.0
     dy_val = float(row_match.get("dividend_yield", 2.5)) if pd.notnull(row_match.get("dividend_yield")) else 2.5
     fund_base = 35.0 if (pe_val <= 25 and dy_val >= 2.0) else 20.0
@@ -1072,7 +1060,6 @@ def show_single_stock_analysis_modal(full_universe_df, default_lookback_days=120
         st.error(f"⚠️ 查無代號「{manual_code}」之台股或 ETF 資料，請確認代號是否輸入正確。")
     elif target_row:
         st.markdown("---")
-        
         stock_lookback = st.session_state.get(f"stock_lookback_{target_row['stock_id']}", default_lookback_days)
         
         with st.spinner("正在運算量化指標與買賣建議..."):
@@ -1334,11 +1321,15 @@ with st.spinner("🚀 載入市場數據中..."):
             try: os.remove(META_JSON_FILE)
             except Exception: pass
         st.cache_data.clear()
+        try:
+            get_live_market_data.clear()
+        except Exception:
+            pass
 
     full_universe_df, tw_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
-        st.toast("✅ 已強制同步最新盤後資料！")
+        st.toast("✅ 已強制向證交所同步最新盤後資料！")
 
 if st.session_state.show_picks_modal:
     show_stock_picks_modal(full_universe_df)
