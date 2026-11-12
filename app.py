@@ -10,6 +10,13 @@ import os
 import json
 
 # ==========================================
+# 全域台灣時間 (UTC+8) 統一基準函式
+# ==========================================
+def get_tw_now() -> datetime:
+    """強制取得台灣標準時間 (UTC+8)，徹底排除雲端伺服器 UTC 時差干擾"""
+    return datetime.utcnow() + timedelta(hours=8)
+
+# ==========================================
 # 頁面基本設定與手機專屬立體設計 CSS 注入
 # ==========================================
 st.set_page_config(
@@ -200,7 +207,7 @@ DEFAULT_THEME_DICT = {
 if "theme_dict" not in st.session_state:
     st.session_state.theme_dict = DEFAULT_THEME_DICT.copy()
 if "theme_last_update" not in st.session_state:
-    st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
+    st.session_state.theme_last_update = get_tw_now().strftime("%Y-%m-%d %H:%M")
 
 def get_stock_themes(stock_id: str) -> list:
     themes = []
@@ -211,9 +218,10 @@ def get_stock_themes(stock_id: str) -> list:
 
 def refresh_market_themes():
     st.session_state.theme_dict = DEFAULT_THEME_DICT.copy()
-    st.session_state.theme_last_update = datetime.now().strftime("%Y-%m-%d %H:%M")
+    st.session_state.theme_last_update = get_tw_now().strftime("%Y-%m-%d %H:%M")
 
 def parse_tw_roc_date_str(roc_date_str: str) -> tuple[str, str]:
+    """將證交所民國年字串解析為 (標準YYYY-MM-DD, 顯示中文標籤)"""
     weekday_map = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
     try:
         clean = re.sub(r"[^\d]", "", str(roc_date_str))
@@ -227,12 +235,12 @@ def parse_tw_roc_date_str(roc_date_str: str) -> tuple[str, str]:
             return date_key, display_label
     except Exception:
         pass
-    tw_now = datetime.now()
+    tw_now = get_tw_now()
     date_key = tw_now.strftime("%Y-%m-%d")
     return date_key, f"{date_key} ({weekday_map.get(tw_now.weekday(), '')})"
 
 # ==========================================
-# 2. 全市場真實數據擷取（單向只進不退保護罩）
+# 2. 全市場真實數據擷取（單向只進不退 + 優先採信 STOCK_DAY_ALL 日期）
 # ==========================================
 def fetch_full_market_universe(force_refresh: bool = False):
     can_read_cache = os.path.exists(CACHE_PARQUET_FILE) and os.path.exists(META_JSON_FILE)
@@ -246,8 +254,9 @@ def fetch_full_market_universe(force_refresh: bool = False):
             cached_date_key = meta_info.get("data_date", "")
             cached_label = meta_info.get("tw_date_label", "")
             
+            # 快取時間改為 15 分鐘 (900秒) 內直接快取讀取，超過即嘗試檢視是否有更新
             mtime = datetime.fromtimestamp(os.path.getmtime(CACHE_PARQUET_FILE))
-            if not force_refresh and (datetime.now() - mtime).total_seconds() < 2700 and cached_date_key:
+            if not force_refresh and (datetime.now() - mtime).total_seconds() < 900 and cached_date_key:
                 df_c = pd.read_parquet(CACHE_PARQUET_FILE)
                 if not df_c.empty and len(df_c) >= 1000:
                     df_c["themes"] = df_c["stock_id"].apply(get_stock_themes)
@@ -261,8 +270,10 @@ def fetch_full_market_universe(force_refresh: bool = False):
         "Pragma": "no-cache"
     }
     market_rows = []
-    twse_raw_date_str = ""
+    stock_day_date_str = ""
+    bwibbu_date_str = ""
 
+    # 先抓估值表，但日期僅作為次要備用
     pe_twse = {}
     try:
         r_pe = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL", headers=headers, timeout=10)
@@ -270,8 +281,8 @@ def fetch_full_market_universe(force_refresh: bool = False):
             for row in r_pe.json():
                 code = str(row.get("Code", "")).strip()
                 if re.match(r"^[1-9]\d{3}$", code):
-                    if not twse_raw_date_str and "Date" in row:
-                        twse_raw_date_str = str(row["Date"])
+                    if not bwibbu_date_str and "Date" in row:
+                        bwibbu_date_str = str(row["Date"])
                     pe_twse[code] = {
                         "name": row.get("Name", "").strip(),
                         "pe": pd.to_numeric(str(row.get("PEratio", "")).replace(",", ""), errors="coerce"),
@@ -281,14 +292,15 @@ def fetch_full_market_universe(force_refresh: bool = False):
     except Exception:
         pass
 
+    # 重點：最優先採信 STOCK_DAY_ALL (每日成交收盤表) 的日期，因為它最早更新
     try:
         r_p = requests.get("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL", headers=headers, timeout=10)
         if r_p.status_code == 200:
             for row in r_p.json():
                 code = str(row.get("Code", "")).strip()
                 name = str(row.get("Name", "")).strip()
-                if not twse_raw_date_str and "Date" in row:
-                    twse_raw_date_str = str(row["Date"])
+                if not stock_day_date_str and "Date" in row:
+                    stock_day_date_str = str(row["Date"])
                 
                 if re.match(r"^(00\d{2,3}[A-Za-z]?|[1-9]\d{3}[A-Za-z]?)$", code):
                     vol_shares = pd.to_numeric(str(row.get("TradeVolume", "")).replace(",", ""), errors="coerce")
@@ -364,9 +376,10 @@ def fetch_full_market_universe(force_refresh: bool = False):
         st.error("⚠️ 無法連線至證交所或櫃買中心取得盤後行情，請檢查網路連線。")
         st.stop()
 
-    new_date_key, new_display_label = parse_tw_roc_date_str(twse_raw_date_str)
+    effective_roc_date = stock_day_date_str if stock_day_date_str else bwibbu_date_str
+    new_date_key, new_display_label = parse_tw_roc_date_str(effective_roc_date)
 
-    # 單向只進不退保護：若 API 夜間吐出舊日期，絕對不覆蓋
+    # 單向只進不退保護：若 API 夜間維護吐出舊日期，拒絕覆蓋
     if can_read_cache and cached_date_key and (new_date_key < cached_date_key):
         df_protect = pd.read_parquet(CACHE_PARQUET_FILE)
         df_protect["themes"] = df_protect["stock_id"].apply(get_stock_themes)
@@ -517,9 +530,9 @@ def compute_regime_pricing(last_close, last_ma5, last_ma20, last_ma60, prev_ma60
     }
 
 # ==========================================
-# 5. 獨立 K 線歷史資料記憶體快取模組
+# 5. 雙引擎 K 線資料快取模組（歷史日線 + 即時 fast_info 自動補齊）
 # ==========================================
-@st.cache_data(ttl=14400, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
     sid = str(sid).strip()
     market_str = str(market_str).strip()
@@ -531,6 +544,7 @@ def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
         if raw.empty or len(raw) < 20:
             alt_ticker = f"{sid}.TWO" if "TW" in ticker and "TWO" not in ticker else f"{sid}.TW"
             raw = yf.download(alt_ticker, period="1y", progress=False, auto_adjust=True)
+            ticker = alt_ticker
             
         if not raw.empty and len(raw) > 20:
             if isinstance(raw.columns, pd.MultiIndex):
@@ -538,6 +552,21 @@ def get_cached_stock_kline(sid: str, market_str: str) -> pd.DataFrame:
             valid_rows = raw[raw["Volume"] > 0].dropna()
             if not valid_rows.empty:
                 hist_df = valid_rows[["Open", "High", "Low", "Close", "Volume"]].copy()
+                
+                # 雙引擎校準：向 fast_info 索取最新即時價格，防止 Yahoo 日線延遲跨日
+                try:
+                    t_obj = yf.Ticker(ticker)
+                    f_info = t_obj.fast_info
+                    live_price = getattr(f_info, "last_price", None)
+                    if live_price and live_price > 0:
+                        last_hist_close = float(hist_df["Close"].iloc[-1])
+                        # 若即時價格與最後一筆日線不同，直接刷新最新收盤價
+                        if abs(live_price - last_hist_close) / last_hist_close > 0.0001:
+                            hist_df.iloc[-1, hist_df.columns.get_loc("Close")] = float(live_price)
+                            hist_df.iloc[-1, hist_df.columns.get_loc("High")] = max(float(hist_df["High"].iloc[-1]), float(live_price))
+                            hist_df.iloc[-1, hist_df.columns.get_loc("Low")] = min(float(hist_df["Low"].iloc[-1]), float(live_price))
+                except Exception:
+                    pass
     except Exception:
         hist_df = pd.DataFrame()
         
@@ -550,7 +579,7 @@ def enrich_candidates_with_kline(candidate_df: pd.DataFrame, selections: dict):
     history_dict = {}
     enriched_rows = []
     
-    dates = pd.bdate_range(end=datetime.today(), periods=250)
+    dates = pd.bdate_range(end=get_tw_now(), periods=250)
     np.random.seed(42)
 
     active_factors = []
@@ -800,9 +829,9 @@ def run_portfolio_backtest(selected_df: pd.DataFrame, history_dict: dict, lookba
     return port_nav, bm_nav, pd.DataFrame(stock_stats), metrics
 
 # ==========================================
-# 8. 即時國際指數抓取（修正點：指數不卡 Volume > 0 限制，確保即日可見）
+# 8. 雙引擎國際與大盤指數抓取（日線 + fast_info 即時校準補齊）
 # ==========================================
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_live_market_data():
     tickers = {
         "台灣加權指數": "^TWII",
@@ -811,19 +840,38 @@ def get_live_market_data():
         "道瓊工業指數": "^DJI"
     }
     data = {}
+    tw_today_str = get_tw_now().strftime("%Y-%m-%d")
+    
     for chinese_name, symbol in tickers.items():
         try:
             df = yf.download(symbol, period="5d", progress=False, auto_adjust=True)
             if not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
-                # 重要修復：指數沒有正常 Volume 欄位，直接 dropna 取最後兩筆 Close
                 clean_closes = df["Close"].dropna()
                 if len(clean_closes) >= 2:
                     curr = float(clean_closes.iloc[-1])
                     prev = float(clean_closes.iloc[-2])
-                    pct = (curr / prev - 1) * 100
                     dt_str = clean_closes.index[-1].strftime("%Y-%m-%d")
+                    
+                    # 雙引擎：主動核對 fast_info，若 Yahoo 日 K 線未更新至最新收盤，自動補入最新價
+                    try:
+                        t_obj = yf.Ticker(symbol)
+                        f_info = t_obj.fast_info
+                        live_p = getattr(f_info, "last_price", None)
+                        prev_c = getattr(f_info, "previous_close", None)
+                        if live_p and live_p > 0:
+                            # 如果即時價格顯著不同，代表有最新尚未歸檔的日線成交
+                            if abs(live_p - curr) / curr > 0.0001:
+                                prev = prev_c if (prev_c and prev_c > 0) else curr
+                                curr = float(live_p)
+                                # 若在台股或美股已收盤時段，刷新日期顯示
+                                if "台灣" in chinese_name and get_tw_now().weekday() < 5:
+                                    dt_str = tw_today_str
+                    except Exception:
+                        pass
+                        
+                    pct = (curr / prev - 1) * 100
                     data[chinese_name] = {"close": round(curr, 2), "pct": round(pct, 2), "date": dt_str}
         except Exception:
             pass
@@ -924,7 +972,7 @@ def get_single_stock_metrics(row_match, lookback_days):
         
     if hist_df.empty:
         np.random.seed(int(re.sub(r'\D', '', sid)) if re.sub(r'\D', '', sid) else 42)
-        dates = pd.bdate_range(end=datetime.today(), periods=250)
+        dates = pd.bdate_range(end=get_tw_now(), periods=250)
         rets = np.random.normal(0.0006, 0.02, len(dates))
         price_path = base_close * np.exp(np.cumsum(rets - rets.mean() + 0.0006))
         price_path = price_path * (base_close / price_path[-1])
@@ -1329,7 +1377,7 @@ with st.spinner("🚀 載入市場數據中..."):
     full_universe_df, tw_trading_date = fetch_full_market_universe(force_refresh=force_run)
     if force_run:
         st.session_state.force_refresh_cache = False
-        st.toast("✅ 已強制向證交所同步最新盤後資料！")
+        st.toast("✅ 已強制同步最新盤後資料！")
 
 if st.session_state.show_picks_modal:
     show_stock_picks_modal(full_universe_df)
